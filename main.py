@@ -1,5 +1,7 @@
 import argparse
+import random
 import os
+import numpy as np
 import yaml
 import wandb
 import torch
@@ -8,6 +10,22 @@ from models import DepMamba
 from datasets import get_dvlog_dataloader, get_lmvd_dataloader
 
 CONFIG_PATH = "./config/config.yaml"
+
+
+
+def seed_everything(seed=42):
+    """Set random seeds for full experiment reproducibility."""
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def parse_args():
     with open(CONFIG_PATH, "r") as f:
@@ -89,6 +107,7 @@ def val(net, val_loader, loss_fn, device, tqdm_able):
     return {"loss": l, "acc": accuracy, "precision": precision, "recall": recall, "f1": f1_score,}
 
 def main():
+    seed_everything(seed=42)
     args = parse_args()
     gpu_ids = _parse_gpu_arg(args.gpu)
     if gpu_ids is None or not torch.cuda.is_available():
