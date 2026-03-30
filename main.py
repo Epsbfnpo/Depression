@@ -1,5 +1,7 @@
 import argparse
+import random
 import os
+import numpy as np
 import yaml
 import wandb
 import torch
@@ -8,6 +10,22 @@ from models import DepMamba
 from datasets import get_dvlog_dataloader, get_lmvd_dataloader
 
 CONFIG_PATH = "./config/config.yaml"
+
+
+
+def seed_everything(seed=42):
+    """Set random seeds for full experiment reproducibility."""
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def parse_args():
     with open(CONFIG_PATH, "r") as f:
@@ -42,18 +60,23 @@ def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, to
     sample_count = 0
     running_loss = 0.
     correct_count = 0
+    aux_weight = 0.3
     with tqdm(train_loader, desc=f"Training epoch {current_epoch}/{total_epochs}", leave=False, unit="batch", disable=tqdm_able) as pbar:
         for x, y, mask in pbar:
             x, y, mask = x.to(device), y.to(device).unsqueeze(1), mask.to(device)
-            y_pred = net(x, mask)
-            loss = loss_fn(y_pred, y.to(torch.float32))
+            y_target = y.to(torch.float32).squeeze(1)
+            y_pred, aux_a, aux_v = net(x, mask)
+            loss_main = loss_fn(y_pred, y_target)
+            loss_a = loss_fn(aux_a, y_target)
+            loss_v = loss_fn(aux_v, y_target)
+            loss = loss_main + aux_weight * loss_a + aux_weight * loss_v
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
             sample_count += x.shape[0]
             running_loss += loss.item() * x.shape[0]
             pred = (y_pred > 0.).int()
-            correct_count += (pred == y).sum().item()
+            correct_count += (pred == y.squeeze(1)).sum().item()
             pbar.set_postfix({"loss": running_loss / sample_count, "acc": correct_count / sample_count,})
     return {"loss": running_loss / sample_count, "acc": correct_count / sample_count,}
 
@@ -66,15 +89,17 @@ def val(net, val_loader, loss_fn, device, tqdm_able):
         with tqdm(val_loader, desc="Validating", leave=False, unit="batch", disable=tqdm_able) as pbar:
             for x, y, mask in pbar:
                 x, y, mask = x.to(device), y.to(device).unsqueeze(1), mask.to(device)
+                y_target = y.to(torch.float32).squeeze(1)
                 y_pred = net(x, mask)
-                loss = loss_fn(y_pred, y.to(torch.float32))
+                loss = loss_fn(y_pred, y_target)
                 sample_count += x.shape[0]
                 running_loss += loss.item() * x.shape[0]
                 pred = (y_pred > 0.).int()
-                TP += torch.sum((pred == 1) & (y == 1)).item()
-                FP += torch.sum((pred == 1) & (y == 0)).item()
-                TN += torch.sum((pred == 0) & (y == 0)).item()
-                FN += torch.sum((pred == 0) & (y == 1)).item()
+                y_binary = y.squeeze(1)
+                TP += torch.sum((pred == 1) & (y_binary == 1)).item()
+                FP += torch.sum((pred == 1) & (y_binary == 0)).item()
+                TN += torch.sum((pred == 0) & (y_binary == 0)).item()
+                FN += torch.sum((pred == 0) & (y_binary == 1)).item()
                 l = running_loss / sample_count
                 precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
                 recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
@@ -89,6 +114,7 @@ def val(net, val_loader, loss_fn, device, tqdm_able):
     return {"loss": l, "acc": accuracy, "precision": precision, "recall": recall, "f1": f1_score,}
 
 def main():
+    seed_everything(seed=42)
     args = parse_args()
     gpu_ids = _parse_gpu_arg(args.gpu)
     if gpu_ids is None or not torch.cuda.is_available():
