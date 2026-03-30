@@ -169,16 +169,81 @@ class EnSSM(nn.Module):
             out = mamba_layer(out, inference_params = inference_params,)
         return out
 
+class MoERouter(nn.Module):
+    """Dynamic router that predicts per-sample expert weights."""
+
+    def __init__(self, input_dim, num_experts=3):
+        super().__init__()
+        hidden_dim = max(1, input_dim // 2)
+        self.router_network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_experts),
+        )
+
+    def forward(self, x, padding_mask=None):
+        # x: [B, L, C]
+        if padding_mask is not None:
+            mask = padding_mask.unsqueeze(-1).float()
+            x_pooled = (x * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
+        else:
+            x_pooled = x.mean(dim=1)
+        logits = self.router_network(x_pooled)
+        return F.softmax(logits, dim=-1)
+
+class MoEEnSSM(nn.Module):
+    """MoE-enhanced fusion module with unimodal auxiliary heads."""
+
+    def __init__(self, d_model_single, d_model_concat, num_layers, d_ffn, activation='Swish', dropout=0.0, causal=False, mamba_config=None):
+        super().__init__()
+        self.router = MoERouter(input_dim=d_model_concat, num_experts=3)
+        self.expert_audio = EnSSM(num_layers, d_model_single, [d_model_single], d_ffn, activation=activation, dropout=dropout, causal=causal, mamba_config=mamba_config)
+        self.expert_video = EnSSM(num_layers, d_model_single, [d_model_single], d_ffn, activation=activation, dropout=dropout, causal=causal, mamba_config=mamba_config)
+        self.expert_fusion = EnSSM(num_layers, d_model_concat, [d_model_concat], d_ffn, activation=activation, dropout=dropout, causal=causal, mamba_config=mamba_config)
+        self.proj_a = nn.Linear(d_model_single, d_model_concat)
+        self.proj_v = nn.Linear(d_model_single, d_model_concat)
+        self.layer_norm = LayerNorm(d_model_concat, eps=1e-6)
+        self.aux_classifier_a = nn.Linear(d_model_single, 1)
+        self.aux_classifier_v = nn.Linear(d_model_single, 1)
+
+    def forward(self, xa, xv, padding_mask=None):
+        x_concat = torch.cat([xa, xv], dim=-1)
+        weights = self.router(x_concat, padding_mask)
+        w_a = weights[:, 0].unsqueeze(1).unsqueeze(2)
+        w_v = weights[:, 1].unsqueeze(1).unsqueeze(2)
+        w_f = weights[:, 2].unsqueeze(1).unsqueeze(2)
+
+        y_a = self.expert_audio(xa)
+        y_v = self.expert_video(xv)
+        y_f = self.expert_fusion(x_concat)
+
+        y_a_proj = self.proj_a(y_a)
+        y_v_proj = self.proj_v(y_v)
+        out_fused = self.layer_norm(w_a * y_a_proj + w_v * y_v_proj + w_f * y_f)
+
+        if padding_mask is not None:
+            mask = padding_mask.unsqueeze(-1).float()
+            pool_a = (y_a * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
+            pool_v = (y_v * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
+        else:
+            pool_a = y_a.mean(dim=1)
+            pool_v = y_v.mean(dim=1)
+
+        aux_logits_a = self.aux_classifier_a(pool_a).squeeze(-1)
+        aux_logits_v = self.aux_classifier_v(pool_v).squeeze(-1)
+        return out_fused, aux_logits_a, aux_logits_v
+
 class DepMamba(BaseNet):
     def __init__(self, audio_input_size=161, video_input_size=161, mm_input_size=128, mm_output_sizes=[256,64], d_ffn=1024, num_layers=8, dropout=0.1, activation='Swish', causal=False, mamba_config=None):
         super().__init__()
         self.cossm_encoder = CoSSM(num_layers, mm_input_size, mm_output_sizes, d_ffn, activation=activation, dropout=dropout, causal=causal, mamba_config=mamba_config)
         self.conv_audio = nn.Conv1d(audio_input_size, mm_input_size, 1, padding=0, dilation=1, bias=False)
         self.conv_video = nn.Conv1d(video_input_size, mm_input_size, 1, padding=0, dilation=1, bias=False)
-        self.enssm_encoder = EnSSM(num_layers, mm_output_sizes[-1]*2, [mm_output_sizes[-1]*2], d_ffn, activation=activation, dropout=dropout, causal=causal, mamba_config=mamba_config)
+        self.moe_enssm = MoEEnSSM(num_layers=num_layers, d_model_single=mm_output_sizes[-1], d_model_concat=mm_output_sizes[-1]*2, d_ffn=d_ffn, activation=activation, dropout=dropout, causal=causal, mamba_config=mamba_config)
         self.pool = nn.AdaptiveMaxPool1d(1)
         self.output = nn.Linear(mm_output_sizes[-1]*2, 1)
-        self.m = nn.Sigmoid()
+        self.current_aux_a = None
+        self.current_aux_v = None
         nn.init.xavier_uniform_(self.conv_audio.weight.data)
         nn.init.xavier_uniform_(self.conv_video.weight.data)
 
@@ -188,8 +253,9 @@ class DepMamba(BaseNet):
         xa = self.conv_audio(xa.permute(0,2,1)).permute(0,2,1)
         xv = self.conv_video(xv.permute(0,2,1)).permute(0,2,1)
         xa, xv = self.cossm_encoder(xa, xv, a_inference_params, v_inference_params)
-        x = torch.cat([xa,xv],dim=-1)
-        x = self.enssm_encoder(x)
+        x, aux_a, aux_v = self.moe_enssm(xa, xv, padding_mask)
+        self.current_aux_a = aux_a
+        self.current_aux_v = aux_v
         if padding_mask is not None:
             x = x * (padding_mask.unsqueeze(-1).float())
             x = x.sum(dim=1) / (padding_mask.unsqueeze(-1).float()).sum(dim=1, keepdim=False)
@@ -199,3 +265,10 @@ class DepMamba(BaseNet):
 
     def classifier(self, x):
         return self.output(x)
+
+    def forward(self, x, padding_mask=None, **kwargs):
+        x = self.feature_extractor(x, padding_mask)
+        out = self.output(x).squeeze(-1)
+        if self.training:
+            return out, self.current_aux_a, self.current_aux_v
+        return out
