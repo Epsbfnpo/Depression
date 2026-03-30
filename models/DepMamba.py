@@ -212,6 +212,9 @@ class MoEEnSSM(nn.Module):
         w_a = weights[:, 0].unsqueeze(1).unsqueeze(2)
         w_v = weights[:, 1].unsqueeze(1).unsqueeze(2)
         w_f = weights[:, 2].unsqueeze(1).unsqueeze(2)
+        self.dbg_w_a = weights[:, 0].mean().item()
+        self.dbg_w_v = weights[:, 1].mean().item()
+        self.dbg_w_f = weights[:, 2].mean().item()
 
         y_a = self.expert_audio(xa)
         y_v = self.expert_video(xv)
@@ -271,4 +274,10 @@ class DepMamba(BaseNet):
         out = self.output(x).squeeze(-1)
         if self.training:
             return out, self.current_aux_a, self.current_aux_v
-        return out
+        try:
+            w_a = self.moe_enssm.dbg_w_a
+            w_v = self.moe_enssm.dbg_w_v
+            w_f = self.moe_enssm.dbg_w_f
+        except Exception:
+            w_a, w_v, w_f = -1.0, -1.0, -1.0
+        return out, out.new_tensor(w_a), out.new_tensor(w_v), out.new_tensor(w_f)
