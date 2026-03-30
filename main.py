@@ -77,7 +77,12 @@ def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, to
             running_loss += loss.item() * x.shape[0]
             pred = (y_pred > 0.).int()
             correct_count += (pred == y.squeeze(1)).sum().item()
-            pbar.set_postfix({"loss": running_loss / sample_count, "acc": correct_count / sample_count,})
+            pbar.set_postfix({
+                "L_M": f"{loss_main.item():.2f}",
+                "L_A": f"{loss_a.item():.2f}",
+                "L_V": f"{loss_v.item():.2f}",
+                "acc": f"{correct_count / sample_count:.2f}",
+            })
     return {"loss": running_loss / sample_count, "acc": correct_count / sample_count,}
 
 def val(net, val_loader, loss_fn, device, tqdm_able):
@@ -85,16 +90,24 @@ def val(net, val_loader, loss_fn, device, tqdm_able):
     sample_count = 0
     running_loss = 0.
     TP, FP, TN, FN = 0, 0, 0, 0
+    total_wa, total_wv, total_wf = 0.0, 0.0, 0.0
+    total_logits = 0.0
+    batches = 0
     with torch.no_grad():
         with tqdm(val_loader, desc="Validating", leave=False, unit="batch", disable=tqdm_able) as pbar:
             for x, y, mask in pbar:
                 x, y, mask = x.to(device), y.to(device).unsqueeze(1), mask.to(device)
                 y_target = y.to(torch.float32).squeeze(1)
-                y_pred = net(x, mask)
+                y_pred, w_a, w_v, w_f = net(x, mask)
                 loss = loss_fn(y_pred, y_target)
                 sample_count += x.shape[0]
                 running_loss += loss.item() * x.shape[0]
                 pred = (y_pred > 0.).int()
+                total_wa += w_a.mean().item() if torch.is_tensor(w_a) else float(w_a)
+                total_wv += w_v.mean().item() if torch.is_tensor(w_v) else float(w_v)
+                total_wf += w_f.mean().item() if torch.is_tensor(w_f) else float(w_f)
+                total_logits += y_pred.mean().item()
+                batches += 1
                 y_binary = y.squeeze(1)
                 TP += torch.sum((pred == 1) & (y_binary == 1)).item()
                 FP += torch.sum((pred == 1) & (y_binary == 0)).item()
@@ -106,6 +119,9 @@ def val(net, val_loader, loss_fn, device, tqdm_able):
                 f1_score = (2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0)
                 accuracy = ((TP + TN) / sample_count if sample_count > 0 else 0.0)
                 pbar.set_postfix({"loss": l, "acc": accuracy, "precision": precision, "recall": recall, "f1": f1_score,})
+    print(f"\n[DEBUG] Avg Router Weights -> Audio: {total_wa / max(1, batches):.3f} | Video: {total_wv / max(1, batches):.3f} | Fusion: {total_wf / max(1, batches):.3f}")
+    print(f"[DEBUG] Avg Logits output: {total_logits / max(1, batches):.3f} (If >> 0, model is biased towards Positive)")
+    print(f"[DEBUG] Confusion Matrix: TP={TP}, FP={FP}, TN={TN}, FN={FN}")
     l = running_loss / sample_count
     precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
     recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
