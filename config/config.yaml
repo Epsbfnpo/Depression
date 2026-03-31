@@ -8,8 +8,10 @@ train: true
 epochs: 120
 batch_size: 16
 learning_rate: 8e-5
-aux_weight: 0.1
-bal_weight: 1.0
+router_learning_rate: 8e-6
+aux_weight: 0.01
+bal_weight: 2.0
+weight_decay: 1e-2
 # audio_dropout is fixed to 0.3 in MoE audio expert input (models/DepMamba.py)
 lr_scheduler: cos
 if_wandb: false

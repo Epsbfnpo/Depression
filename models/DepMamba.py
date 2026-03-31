@@ -189,7 +189,9 @@ class MoERouter(nn.Module):
         else:
             x_pooled = x.mean(dim=1)
         logits = self.router_network(x_pooled)
-        return F.softmax(logits, dim=-1)
+        logits = logits / (torch.norm(logits, dim=-1, keepdim=True) + 1e-8)
+        temperature = 10.0
+        return F.softmax(logits * 5.0 / temperature, dim=-1)
 
 class MoEEnSSM(nn.Module):
     """MoE-enhanced fusion module with unimodal auxiliary heads."""

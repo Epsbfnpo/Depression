@@ -43,8 +43,10 @@ def parse_args():
     parser.add_argument("-e", "--epochs", type=int)
     parser.add_argument("-bs", "--batch_size", type=int)
     parser.add_argument("-lr", "--learning_rate", type=float)
-    parser.add_argument("--aux_weight", type=float, default=0.1)
-    parser.add_argument("--bal_weight", type=float, default=1.0)
+    parser.add_argument("--aux_weight", type=float, default=0.01)
+    parser.add_argument("--bal_weight", type=float, default=2.0)
+    parser.add_argument("--router_learning_rate", type=float)
+    parser.add_argument("--weight_decay", type=float, default=1e-2)
     parser.add_argument("-ds", "--dataset", type=str)
     parser.add_argument("-g", "--gpu", type=str, default="0", help="GPU id(s), e.g. '0' or '0,1' or 'cuda:0,1' or 'cpu'")
     parser.add_argument("-wdb", "--if_wandb", type=bool, default=False)
@@ -62,7 +64,7 @@ def _parse_gpu_arg(gpu_arg: str):
     ids = [int(x) for x in s.split(",") if x != ""]
     return ids
 
-def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, total_epochs, tqdm_able, aux_weight=0.1, bal_weight=1.0):
+def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, total_epochs, tqdm_able, aux_weight=0.01, bal_weight=2.0):
     net.train()
     sample_count = 0
     running_loss = 0.
@@ -75,8 +77,8 @@ def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, to
             loss_main = loss_fn(y_pred, y_target)
             loss_a = loss_fn(aux_a, y_target)
             loss_v = loss_fn(aux_v, y_target)
-            avg_weights = weights.mean(dim=0)
-            loss_bal = torch.std(avg_weights)
+            f = weights.mean(dim=0)
+            loss_bal = (f.std() / (f.mean() + 1e-8)).pow(2)
             loss = loss_main + aux_weight * (loss_a + loss_v) + bal_weight * loss_bal
             loss.backward()
             optimizer.step()
@@ -186,7 +188,17 @@ def main():
             val_loader = get_lmvd_dataloader(args.data_dir, "valid", args.batch_size, args.test_gender)
             test_loader = get_lmvd_dataloader(args.data_dir, "test", args.batch_size, args.test_gender)
         loss_fn = torch.nn.BCEWithLogitsLoss()
-        optimizer = torch.optim.Adam(net.parameters(), lr=args.learning_rate)
+        router_lr = args.router_learning_rate if args.router_learning_rate is not None else args.learning_rate * 0.1
+        named_params = list(net.named_parameters())
+        router_params = [p for n, p in named_params if "moe_enssm.router" in n]
+        base_params = [p for n, p in named_params if "moe_enssm.router" not in n]
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": base_params, "lr": args.learning_rate},
+                {"params": router_params, "lr": router_lr},
+            ],
+            weight_decay=args.weight_decay,
+        )
         best_val_acc = -1.0
         best_test_acc = -1.0
         if args.train:
