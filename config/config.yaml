@@ -8,6 +8,9 @@ train: true
 epochs: 120
 batch_size: 16
 learning_rate: 8e-5
+aux_weight: 0.1
+bal_weight: 1.0
+# audio_dropout is fixed to 0.3 in MoE audio expert input (models/DepMamba.py)
 lr_scheduler: cos
 if_wandb: false
 save_dir: "/datasets/work/hb-nhmrc-dhcp/work/liu275/Depression/DepMamba/mambamodels"
