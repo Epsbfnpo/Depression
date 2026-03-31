@@ -24,8 +24,13 @@ def seed_everything(seed=42):
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
+    # 基础的 cudnn 确定性设置
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+    # 强制 PyTorch 使用确定性算法，并固定 CUDA 工作区配置
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
 def parse_args():
     with open(CONFIG_PATH, "r") as f:
@@ -130,7 +135,6 @@ def val(net, val_loader, loss_fn, device, tqdm_able):
     return {"loss": l, "acc": accuracy, "precision": precision, "recall": recall, "f1": f1_score,}
 
 def main():
-    seed_everything(seed=42)
     args = parse_args()
     gpu_ids = _parse_gpu_arg(args.gpu)
     if gpu_ids is None or not torch.cuda.is_available():
@@ -143,6 +147,12 @@ def main():
     print(f"[Device] primary={primary_device}, data_parallel_ids={dp_device_ids}")
     args.data_dir = os.path.join(args.data_dir,args.dataset)
     for i_iter in range(3):
+        current_seed = 42 + i_iter
+        seed_everything(seed=current_seed)
+        print(f"\n=======================================================")
+        print(f"[INFO] Starting Iteration {i_iter} with Random Seed: {current_seed}")
+        print(f"=======================================================\n")
+
         if args.if_wandb:
             wandb_run_name = f"{args.model}-{args.train_gender}-{args.test_gender}"
             wandb.init(project="mamnba_ad", config=args, name=wandb_run_name,)
