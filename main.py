@@ -203,16 +203,19 @@ def main():
             with open(f'./results/{args.dataset}_{args.model}_{str(i_iter)}.txt','w') as f:    
                 test_result_str = f'Accuracy:{test_results["acc"]}, Precision:{test_results["precision"]}, Recall:{test_results["recall"]}, F1:{test_results["f1"]}, Avg:{(test_results["acc"] + test_results["precision"]+ test_results["recall"]+ test_results["f1"])/4.0}'
                 f.write(test_result_str)
+
+            if args.if_wandb:
+                artifact = wandb.Artifact(f"best_model_iter_{i_iter}", type="model")
+                artifact.add_file(f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt")
+                wandb.log_artifact(artifact)
+                wandb.log({
+                    f"test_iter_{i_iter}/acc": test_results["acc"],
+                    f"test_iter_{i_iter}/loss": test_results["loss"],
+                    f"test_iter_{i_iter}/precision": test_results["precision"],
+                    f"test_iter_{i_iter}/recall": test_results["recall"],
+                    f"test_iter_{i_iter}/f1": test_results["f1"],
+                })
     if args.if_wandb:
-        artifact = wandb.Artifact("best_model", type="model")
-        artifact.add_file(f"{args.save_dir}/{args.model}/checkpoints/best_model.pt")
-        wandb.run.summary["acc/best_val_acc"] = best_val_acc
-        wandb.log_artifact(artifact)
-        wandb.run.summary["acc/test_acc"] = test_results["acc"]
-        wandb.run.summary["loss/test_loss"] = test_results["loss"]
-        wandb.run.summary["precision/test_precision"] = test_results["precision"]
-        wandb.run.summary["recall/test_recall"] = test_results["recall"]
-        wandb.run.summary["f1/test_f1"] = test_results["f1"]
         wandb.finish()
 
 if __name__ == '__main__':
