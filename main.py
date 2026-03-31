@@ -43,6 +43,8 @@ def parse_args():
     parser.add_argument("-e", "--epochs", type=int)
     parser.add_argument("-bs", "--batch_size", type=int)
     parser.add_argument("-lr", "--learning_rate", type=float)
+    parser.add_argument("--aux_weight", type=float, default=0.1)
+    parser.add_argument("--bal_weight", type=float, default=1.0)
     parser.add_argument("-ds", "--dataset", type=str)
     parser.add_argument("-g", "--gpu", type=str, default="0", help="GPU id(s), e.g. '0' or '0,1' or 'cuda:0,1' or 'cpu'")
     parser.add_argument("-wdb", "--if_wandb", type=bool, default=False)
@@ -60,21 +62,22 @@ def _parse_gpu_arg(gpu_arg: str):
     ids = [int(x) for x in s.split(",") if x != ""]
     return ids
 
-def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, total_epochs, tqdm_able):
+def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, total_epochs, tqdm_able, aux_weight=0.1, bal_weight=1.0):
     net.train()
     sample_count = 0
     running_loss = 0.
     correct_count = 0
-    aux_weight = 0.3
     with tqdm(train_loader, desc=f"Training epoch {current_epoch}/{total_epochs}", leave=False, unit="batch", disable=tqdm_able) as pbar:
         for x, y, mask in pbar:
             x, y, mask = x.to(device), y.to(device).unsqueeze(1), mask.to(device)
             y_target = y.to(torch.float32).squeeze(1)
-            y_pred, aux_a, aux_v = net(x, mask)
+            y_pred, aux_a, aux_v, weights = net(x, mask)
             loss_main = loss_fn(y_pred, y_target)
             loss_a = loss_fn(aux_a, y_target)
             loss_v = loss_fn(aux_v, y_target)
-            loss = loss_main + aux_weight * loss_a + aux_weight * loss_v
+            avg_weights = weights.mean(dim=0)
+            loss_bal = torch.std(avg_weights)
+            loss = loss_main + aux_weight * (loss_a + loss_v) + bal_weight * loss_bal
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
@@ -86,6 +89,7 @@ def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, to
                 "L_M": f"{loss_main.item():.2f}",
                 "L_A": f"{loss_a.item():.2f}",
                 "L_V": f"{loss_v.item():.2f}",
+                "L_B": f"{loss_bal.item():.2f}",
                 "acc": f"{correct_count / sample_count:.2f}",
             })
     return {"loss": running_loss / sample_count, "acc": correct_count / sample_count,}
@@ -187,7 +191,18 @@ def main():
         best_test_acc = -1.0
         if args.train:
             for epoch in range(args.epochs):
-                train_results = train_epoch(net, train_loader, loss_fn, optimizer, args.device[0], epoch, args.epochs, args.tqdm_able)
+                train_results = train_epoch(
+                    net,
+                    train_loader,
+                    loss_fn,
+                    optimizer,
+                    args.device[0],
+                    epoch,
+                    args.epochs,
+                    args.tqdm_able,
+                    aux_weight=args.aux_weight,
+                    bal_weight=args.bal_weight,
+                )
                 val_results = val(net, val_loader, loss_fn, args.device[0],args.tqdm_able)
                 val_acc = (val_results["acc"] + val_results["precision"]+ val_results["recall"]+ val_results["f1"])/4.0
                 if val_acc > best_val_acc:

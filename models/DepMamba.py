@@ -216,7 +216,7 @@ class MoEEnSSM(nn.Module):
         self.dbg_w_v = weights[:, 1].mean().item()
         self.dbg_w_f = weights[:, 2].mean().item()
 
-        y_a = self.expert_audio(xa)
+        y_a = self.expert_audio(F.dropout(xa, p=0.3, training=self.training))
         y_v = self.expert_video(xv)
         y_f = self.expert_fusion(x_concat)
 
@@ -234,7 +234,7 @@ class MoEEnSSM(nn.Module):
 
         aux_logits_a = self.aux_classifier_a(pool_a).squeeze(-1)
         aux_logits_v = self.aux_classifier_v(pool_v).squeeze(-1)
-        return out_fused, aux_logits_a, aux_logits_v
+        return out_fused, aux_logits_a, aux_logits_v, weights
 
 class DepMamba(BaseNet):
     def __init__(self, audio_input_size=161, video_input_size=161, mm_input_size=128, mm_output_sizes=[256,64], d_ffn=1024, num_layers=8, dropout=0.1, activation='Swish', causal=False, mamba_config=None):
@@ -247,6 +247,7 @@ class DepMamba(BaseNet):
         self.output = nn.Linear(mm_output_sizes[-1]*2, 1)
         self.current_aux_a = None
         self.current_aux_v = None
+        self.current_weights = None
         nn.init.xavier_uniform_(self.conv_audio.weight.data)
         nn.init.xavier_uniform_(self.conv_video.weight.data)
 
@@ -256,9 +257,10 @@ class DepMamba(BaseNet):
         xa = self.conv_audio(xa.permute(0,2,1)).permute(0,2,1)
         xv = self.conv_video(xv.permute(0,2,1)).permute(0,2,1)
         xa, xv = self.cossm_encoder(xa, xv, a_inference_params, v_inference_params)
-        x, aux_a, aux_v = self.moe_enssm(xa, xv, padding_mask)
+        x, aux_a, aux_v, weights = self.moe_enssm(xa, xv, padding_mask)
         self.current_aux_a = aux_a
         self.current_aux_v = aux_v
+        self.current_weights = weights
         if padding_mask is not None:
             x = x * (padding_mask.unsqueeze(-1).float())
             x = x.sum(dim=1) / (padding_mask.unsqueeze(-1).float()).sum(dim=1, keepdim=False)
@@ -273,7 +275,7 @@ class DepMamba(BaseNet):
         x = self.feature_extractor(x, padding_mask)
         out = self.output(x).squeeze(-1)
         if self.training:
-            return out, self.current_aux_a, self.current_aux_v
+            return out, self.current_aux_a, self.current_aux_v, self.current_weights
         try:
             w_a = self.moe_enssm.dbg_w_a
             w_v = self.moe_enssm.dbg_w_v
