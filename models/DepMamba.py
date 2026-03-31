@@ -190,8 +190,8 @@ class MoERouter(nn.Module):
             x_pooled = x.mean(dim=1)
         logits = self.router_network(x_pooled)
         logits = logits / (torch.norm(logits, dim=-1, keepdim=True) + 1e-8)
-        temperature = 10.0
-        return F.softmax(logits * 5.0 / temperature, dim=-1)
+        temperature = 1.5
+        return F.softmax(logits / temperature, dim=-1)
 
 class MoEEnSSM(nn.Module):
     """MoE-enhanced fusion module with unimodal auxiliary heads."""
@@ -246,6 +246,7 @@ class DepMamba(BaseNet):
         self.conv_video = nn.Conv1d(video_input_size, mm_input_size, 1, padding=0, dilation=1, bias=False)
         self.moe_enssm = MoEEnSSM(num_layers=num_layers, d_model_single=mm_output_sizes[-1], d_model_concat=mm_output_sizes[-1]*2, d_ffn=d_ffn, activation=activation, dropout=dropout, causal=causal, mamba_config=mamba_config)
         self.pool = nn.AdaptiveMaxPool1d(1)
+        self.classifier_drop = nn.Dropout(0.5)
         self.output = nn.Linear(mm_output_sizes[-1]*2, 1)
         self.current_aux_a = None
         self.current_aux_v = None
@@ -268,6 +269,7 @@ class DepMamba(BaseNet):
             x = x.sum(dim=1) / (padding_mask.unsqueeze(-1).float()).sum(dim=1, keepdim=False)
         else:
             x = self.pool(x.permute(0,2,1)).squeeze(-1)
+        x = self.classifier_drop(x)
         return x
 
     def classifier(self, x):
