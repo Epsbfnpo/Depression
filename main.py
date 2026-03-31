@@ -146,6 +146,12 @@ def main():
         dp_device_ids = gpu_ids if len(gpu_ids) > 1 else None
     print(f"[Device] primary={primary_device}, data_parallel_ids={dp_device_ids}")
     args.data_dir = os.path.join(args.data_dir,args.dataset)
+
+    if args.if_wandb:
+        wandb_run_name = f"{args.model}-{args.train_gender}-{args.test_gender}-3seeds"
+        wandb.init(project="mamnba_ad", config=args, name=wandb_run_name)
+        args = wandb.config
+
     for i_iter in range(3):
         current_seed = 42 + i_iter
         seed_everything(seed=current_seed)
@@ -153,10 +159,6 @@ def main():
         print(f"[INFO] Starting Iteration {i_iter} with Random Seed: {current_seed}")
         print(f"=======================================================\n")
 
-        if args.if_wandb:
-            wandb_run_name = f"{args.model}-{args.train_gender}-{args.test_gender}"
-            wandb.init(project="mamnba_ad", config=args, name=wandb_run_name,)
-            args = wandb.config
         print(args)
         os.makedirs(f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}", exist_ok=True)
         os.makedirs(f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/samples", exist_ok=True)
