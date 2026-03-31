@@ -24,8 +24,13 @@ def seed_everything(seed=42):
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
+    # 基础的 cudnn 确定性设置
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+    # 强制 PyTorch 使用确定性算法，并固定 CUDA 工作区配置
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
 def parse_args():
     with open(CONFIG_PATH, "r") as f:
@@ -130,7 +135,6 @@ def val(net, val_loader, loss_fn, device, tqdm_able):
     return {"loss": l, "acc": accuracy, "precision": precision, "recall": recall, "f1": f1_score,}
 
 def main():
-    seed_everything(seed=42)
     args = parse_args()
     gpu_ids = _parse_gpu_arg(args.gpu)
     if gpu_ids is None or not torch.cuda.is_available():
@@ -143,6 +147,12 @@ def main():
     print(f"[Device] primary={primary_device}, data_parallel_ids={dp_device_ids}")
     args.data_dir = os.path.join(args.data_dir,args.dataset)
     for i_iter in range(3):
+        current_seed = 42 + i_iter
+        seed_everything(seed=current_seed)
+        print(f"\n=======================================================")
+        print(f"[INFO] Starting Iteration {i_iter} with Random Seed: {current_seed}")
+        print(f"=======================================================\n")
+
         if args.if_wandb:
             wandb_run_name = f"{args.model}-{args.train_gender}-{args.test_gender}"
             wandb.init(project="mamnba_ad", config=args, name=wandb_run_name,)
@@ -193,16 +203,19 @@ def main():
             with open(f'./results/{args.dataset}_{args.model}_{str(i_iter)}.txt','w') as f:    
                 test_result_str = f'Accuracy:{test_results["acc"]}, Precision:{test_results["precision"]}, Recall:{test_results["recall"]}, F1:{test_results["f1"]}, Avg:{(test_results["acc"] + test_results["precision"]+ test_results["recall"]+ test_results["f1"])/4.0}'
                 f.write(test_result_str)
+
+            if args.if_wandb:
+                artifact = wandb.Artifact(f"best_model_iter_{i_iter}", type="model")
+                artifact.add_file(f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt")
+                wandb.log_artifact(artifact)
+                wandb.log({
+                    f"test_iter_{i_iter}/acc": test_results["acc"],
+                    f"test_iter_{i_iter}/loss": test_results["loss"],
+                    f"test_iter_{i_iter}/precision": test_results["precision"],
+                    f"test_iter_{i_iter}/recall": test_results["recall"],
+                    f"test_iter_{i_iter}/f1": test_results["f1"],
+                })
     if args.if_wandb:
-        artifact = wandb.Artifact("best_model", type="model")
-        artifact.add_file(f"{args.save_dir}/{args.model}/checkpoints/best_model.pt")
-        wandb.run.summary["acc/best_val_acc"] = best_val_acc
-        wandb.log_artifact(artifact)
-        wandb.run.summary["acc/test_acc"] = test_results["acc"]
-        wandb.run.summary["loss/test_loss"] = test_results["loss"]
-        wandb.run.summary["precision/test_precision"] = test_results["precision"]
-        wandb.run.summary["recall/test_recall"] = test_results["recall"]
-        wandb.run.summary["f1/test_f1"] = test_results["f1"]
         wandb.finish()
 
 if __name__ == '__main__':
