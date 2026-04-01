@@ -169,39 +169,64 @@ class EnSSM(nn.Module):
             out = mamba_layer(out, inference_params = inference_params,)
         return out
 
-class MoERouter(nn.Module):
-    """Dynamic router that predicts per-sample expert weights."""
+class ImprovedMoERouter(nn.Module):
+    """具有时序感知和探索机制的动态路由器"""
 
     def __init__(self, input_dim, num_experts=3):
         super().__init__()
-        hidden_dim = max(1, input_dim // 2)
+        conv_dim = max(1, input_dim // 2)
+        hidden_dim = max(1, input_dim // 4)
+        self.temporal_conv = nn.Conv1d(input_dim, conv_dim, kernel_size=3, padding=1)
+        self.relu = nn.ReLU()
         self.router_network = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            nn.Linear(conv_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, num_experts),
         )
+        self.temperature = 1.0
 
     def forward(self, x, padding_mask=None):
-        # x: [B, L, C]
+        x_t = x.permute(0, 2, 1)
+        x_t = self.relu(self.temporal_conv(x_t))
         if padding_mask is not None:
-            mask = padding_mask.unsqueeze(-1).float()
-            x_pooled = (x * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
+            mask = padding_mask.unsqueeze(1).float()
+            x_pooled = (x_t * mask).sum(dim=2) / (mask.sum(dim=2) + 1e-8)
         else:
-            x_pooled = x.mean(dim=1)
+            x_pooled = x_t.mean(dim=2)
         logits = self.router_network(x_pooled)
-        logits = logits / (torch.norm(logits, dim=-1, keepdim=True) + 1e-8)
-        temperature = 1.5
-        return F.softmax(logits / temperature, dim=-1)
+        if self.training:
+            noise = -torch.log(-torch.log(torch.rand_like(logits) + 1e-8) + 1e-8)
+            logits = logits + noise * 0.5
+        return F.softmax(logits / self.temperature, dim=-1)
 
-class MoEEnSSM(nn.Module):
-    """MoE-enhanced fusion module with unimodal auxiliary heads."""
+class LightweightExpert(nn.Module):
+    """极简专家网络：防止小数据集上的严重过拟合"""
 
-    def __init__(self, d_model_single, d_model_concat, num_layers, d_ffn, activation='Swish', dropout=0.0, causal=False, mamba_config=None):
+    def __init__(self, d_model, dropout=0.3):
         super().__init__()
-        self.router = MoERouter(input_dim=d_model_concat, num_experts=3)
-        self.expert_audio = EnSSM(num_layers, d_model_single, [d_model_single], d_ffn, activation=activation, dropout=dropout, causal=causal, mamba_config=mamba_config)
-        self.expert_video = EnSSM(num_layers, d_model_single, [d_model_single], d_ffn, activation=activation, dropout=dropout, causal=causal, mamba_config=mamba_config)
-        self.expert_fusion = EnSSM(num_layers, d_model_concat, [d_model_concat], d_ffn, activation=activation, dropout=dropout, causal=causal, mamba_config=mamba_config)
+        bottleneck_dim = max(1, d_model // 2)
+        self.net = nn.Sequential(
+            nn.Linear(d_model, bottleneck_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(bottleneck_dim, d_model),
+            nn.Dropout(dropout),
+        )
+        self.norm = LayerNorm(d_model, eps=1e-6)
+
+    def forward(self, x):
+        return self.norm(x + self.net(x))
+
+
+class LightweightMoE(nn.Module):
+    """轻量级混合专家系统"""
+
+    def __init__(self, d_model_single, d_model_concat, dropout=0.3):
+        super().__init__()
+        self.router = ImprovedMoERouter(input_dim=d_model_concat, num_experts=3)
+        self.expert_audio = LightweightExpert(d_model_single, dropout=dropout)
+        self.expert_video = LightweightExpert(d_model_single, dropout=dropout)
+        self.expert_fusion = LightweightExpert(d_model_concat, dropout=dropout)
         self.proj_a = nn.Linear(d_model_single, d_model_concat)
         self.proj_v = nn.Linear(d_model_single, d_model_concat)
         self.layer_norm = LayerNorm(d_model_concat, eps=1e-6)
@@ -217,8 +242,11 @@ class MoEEnSSM(nn.Module):
         self.dbg_w_a = weights[:, 0].mean().item()
         self.dbg_w_v = weights[:, 1].mean().item()
         self.dbg_w_f = weights[:, 2].mean().item()
+        self.dbg_var_a = weights[:, 0].var().item()
+        self.dbg_var_v = weights[:, 1].var().item()
+        self.dbg_var_f = weights[:, 2].var().item()
 
-        y_a = self.expert_audio(F.dropout(xa, p=0.3, training=self.training))
+        y_a = self.expert_audio(xa)
         y_v = self.expert_video(xv)
         y_f = self.expert_fusion(x_concat)
 
@@ -244,7 +272,7 @@ class DepMamba(BaseNet):
         self.cossm_encoder = CoSSM(num_layers, mm_input_size, mm_output_sizes, d_ffn, activation=activation, dropout=dropout, causal=causal, mamba_config=mamba_config)
         self.conv_audio = nn.Conv1d(audio_input_size, mm_input_size, 1, padding=0, dilation=1, bias=False)
         self.conv_video = nn.Conv1d(video_input_size, mm_input_size, 1, padding=0, dilation=1, bias=False)
-        self.moe_enssm = MoEEnSSM(num_layers=num_layers, d_model_single=mm_output_sizes[-1], d_model_concat=mm_output_sizes[-1]*2, d_ffn=d_ffn, activation=activation, dropout=dropout, causal=causal, mamba_config=mamba_config)
+        self.moe_enssm = LightweightMoE(d_model_single=mm_output_sizes[-1], d_model_concat=mm_output_sizes[-1]*2, dropout=0.3)
         self.pool = nn.AdaptiveMaxPool1d(1)
         self.classifier_drop = nn.Dropout(0.5)
         self.output = nn.Linear(mm_output_sizes[-1]*2, 1)
@@ -277,14 +305,14 @@ class DepMamba(BaseNet):
         return self.output(x)
 
     def forward(self, x, padding_mask=None, **kwargs):
-        x = self.feature_extractor(x, padding_mask)
-        out = self.output(x).squeeze(-1)
+        x_fused = self.feature_extractor(x, padding_mask)
+        out_main = self.output(x_fused).squeeze(-1)
         if self.training:
-            return out, self.current_aux_a, self.current_aux_v, self.current_weights
+            return out_main, self.current_aux_a, self.current_aux_v, self.current_weights
         try:
             w_a = self.moe_enssm.dbg_w_a
             w_v = self.moe_enssm.dbg_w_v
-            w_f = self.moe_enssm.dbg_w_f
+            w_var_a = self.moe_enssm.dbg_var_a
         except Exception:
-            w_a, w_v, w_f = -1.0, -1.0, -1.0
-        return out, out.new_tensor(w_a), out.new_tensor(w_v), out.new_tensor(w_f)
+            w_a, w_v, w_var_a = -1.0, -1.0, -1.0
+        return out_main, out_main.new_tensor(w_a), out_main.new_tensor(w_v), out_main.new_tensor(w_var_a)

@@ -5,6 +5,7 @@ import numpy as np
 import yaml
 import wandb
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 from models import DepMamba
 from datasets import get_dvlog_dataloader, get_lmvd_dataloader
@@ -64,7 +65,11 @@ def _parse_gpu_arg(gpu_arg: str):
     ids = [int(x) for x in s.split(",") if x != ""]
     return ids
 
-def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, total_epochs, tqdm_able, aux_weight=0.05, bal_weight=0.02):
+def smooth_labels(targets, smoothing=0.1):
+    return targets * (1.0 - smoothing) + 0.5 * smoothing
+
+
+def train_epoch(net, train_loader, criterion_main, optimizer, device, current_epoch, total_epochs, tqdm_able, aux_weight=0.05, bal_weight=0.1):
     net.train()
     sample_count = 0
     running_loss = 0.
@@ -73,36 +78,38 @@ def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, to
         for x, y, mask in pbar:
             x, y, mask = x.to(device), y.to(device).unsqueeze(1), mask.to(device)
             y_target = y.to(torch.float32).squeeze(1)
-            y_target_smoothed = y_target * 0.8 + 0.1
-            y_pred, aux_a, aux_v, weights = net(x, mask)
-            loss_main = loss_fn(y_pred, y_target_smoothed)
-            loss_a = loss_fn(aux_a, y_target_smoothed)
-            loss_v = loss_fn(aux_v, y_target_smoothed)
-            f = weights.mean(dim=0)
-            loss_bal = (f.std() / (f.mean() + 1e-8)).pow(2)
-            loss = loss_main + aux_weight * (loss_a + loss_v) + bal_weight * loss_bal
+            optimizer.zero_grad()
+            out_main, aux_a, aux_v, weights = net(x, mask)
+            smoothed_targets = smooth_labels(y_target, smoothing=0.15)
+            loss_main = criterion_main(out_main, smoothed_targets)
+            loss_aux_a = criterion_main(aux_a, smoothed_targets)
+            loss_aux_v = criterion_main(aux_v, smoothed_targets)
+            mean_router_prob = weights.mean(dim=0)
+            ideal_prob = torch.ones_like(mean_router_prob) / 3.0
+            loss_balance = F.mse_loss(mean_router_prob, ideal_prob)
+            loss = loss_main + aux_weight * (loss_aux_a + loss_aux_v) + bal_weight * loss_balance
+
             loss.backward()
             optimizer.step()
-            optimizer.zero_grad()
             sample_count += x.shape[0]
             running_loss += loss.item() * x.shape[0]
-            pred = (y_pred > 0.).int()
+            pred = (out_main > 0.).int()
             correct_count += (pred == y.squeeze(1)).sum().item()
             pbar.set_postfix({
                 "L_M": f"{loss_main.item():.2f}",
-                "L_A": f"{loss_a.item():.2f}",
-                "L_V": f"{loss_v.item():.2f}",
-                "L_B": f"{loss_bal.item():.2f}",
+                "L_A": f"{loss_aux_a.item():.2f}",
+                "L_V": f"{loss_aux_v.item():.2f}",
+                "L_Bal": f"{loss_balance.item():.2f}",
                 "acc": f"{correct_count / sample_count:.2f}",
             })
     return {"loss": running_loss / sample_count, "acc": correct_count / sample_count,}
 
-def val(net, val_loader, loss_fn, device, tqdm_able):
+def val(net, val_loader, criterion_main, device, tqdm_able):
     net.eval()
     sample_count = 0
     running_loss = 0.
     TP, FP, TN, FN = 0, 0, 0, 0
-    total_wa, total_wv, total_wf = 0.0, 0.0, 0.0
+    total_wa, total_wv, total_wvar = 0.0, 0.0, 0.0
     total_logits = 0.0
     batches = 0
     with torch.no_grad():
@@ -110,14 +117,14 @@ def val(net, val_loader, loss_fn, device, tqdm_able):
             for x, y, mask in pbar:
                 x, y, mask = x.to(device), y.to(device).unsqueeze(1), mask.to(device)
                 y_target = y.to(torch.float32).squeeze(1)
-                y_pred, w_a, w_v, w_f = net(x, mask)
-                loss = loss_fn(y_pred, y_target)
+                y_pred, w_a, w_v, w_var = net(x, mask)
+                loss = criterion_main(y_pred, y_target)
                 sample_count += x.shape[0]
                 running_loss += loss.item() * x.shape[0]
                 pred = (y_pred > 0.).int()
                 total_wa += w_a.mean().item() if torch.is_tensor(w_a) else float(w_a)
                 total_wv += w_v.mean().item() if torch.is_tensor(w_v) else float(w_v)
-                total_wf += w_f.mean().item() if torch.is_tensor(w_f) else float(w_f)
+                total_wvar += w_var.mean().item() if torch.is_tensor(w_var) else float(w_var)
                 total_logits += y_pred.mean().item()
                 batches += 1
                 y_binary = y.squeeze(1)
@@ -131,7 +138,8 @@ def val(net, val_loader, loss_fn, device, tqdm_able):
                 f1_score = (2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0)
                 accuracy = ((TP + TN) / sample_count if sample_count > 0 else 0.0)
                 pbar.set_postfix({"loss": l, "acc": accuracy, "precision": precision, "recall": recall, "f1": f1_score,})
-    print(f"\n[DEBUG] Avg Router Weights -> Audio: {total_wa / max(1, batches):.3f} | Video: {total_wv / max(1, batches):.3f} | Fusion: {total_wf / max(1, batches):.3f}")
+    print(f"\n[DEBUG] Avg Router Weights -> Audio: {total_wa / max(1, batches):.3f} | Video: {total_wv / max(1, batches):.3f}")
+    print(f"[DEBUG] Router Variance -> Audio Var: {total_wvar / max(1, batches):.5f}")
     print(f"[DEBUG] Avg Logits output: {total_logits / max(1, batches):.3f} (If >> 0, model is biased towards Positive)")
     print(f"[DEBUG] Confusion Matrix: TP={TP}, FP={FP}, TN={TN}, FN={FN}")
     l = running_loss / sample_count
@@ -188,7 +196,7 @@ def main():
             train_loader = get_lmvd_dataloader(args.data_dir, "train", args.batch_size, args.train_gender)
             val_loader = get_lmvd_dataloader(args.data_dir, "valid", args.batch_size, args.test_gender)
             test_loader = get_lmvd_dataloader(args.data_dir, "test", args.batch_size, args.test_gender)
-        loss_fn = torch.nn.BCEWithLogitsLoss()
+        criterion_main = torch.nn.BCEWithLogitsLoss()
         router_lr = args.router_learning_rate if args.router_learning_rate is not None else args.learning_rate
         named_params = list(net.named_parameters())
         router_params = [p for n, p in named_params if "moe_enssm.router" in n]
@@ -207,16 +215,16 @@ def main():
                 train_results = train_epoch(
                     net,
                     train_loader,
-                    loss_fn,
+                    criterion_main,
                     optimizer,
                     args.device[0],
                     epoch,
                     args.epochs,
                     args.tqdm_able,
                     aux_weight=args.aux_weight,
-                    bal_weight=args.bal_weight,
+                    bal_weight=max(args.bal_weight, 0.1),
                 )
-                val_results = val(net, val_loader, loss_fn, args.device[0],args.tqdm_able)
+                val_results = val(net, val_loader, criterion_main, args.device[0],args.tqdm_able)
                 val_acc = (val_results["acc"] + val_results["precision"]+ val_results["recall"]+ val_results["f1"])/4.0
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
@@ -226,7 +234,7 @@ def main():
         with torch.no_grad():
             net.load_state_dict(torch.load(f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt", map_location=args.device[0]))
             net.eval()
-            test_results = val(net, test_loader, loss_fn, args.device[0],args.tqdm_able)
+            test_results = val(net, test_loader, criterion_main, args.device[0],args.tqdm_able)
             print("Test results:")
             print(test_results)
             os.makedirs("./results", exist_ok=True)
