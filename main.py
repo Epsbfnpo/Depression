@@ -10,6 +10,7 @@ from models import DepMamba
 from datasets import get_dvlog_dataloader, get_lmvd_dataloader
 
 CONFIG_PATH = "./config/config.yaml"
+DEBUG_GGDM_ONCE = True
 
 
 
@@ -60,7 +61,19 @@ def _parse_gpu_arg(gpu_arg: str):
     ids = [int(x) for x in s.split(",") if x != ""]
     return ids
 
+def _unwrap_model(model):
+    return model.module if isinstance(model, torch.nn.DataParallel) else model
+
+def calc_volume(g_uni, g_multi):
+    g_u_flat = g_uni.reshape(-1)
+    g_m_flat = g_multi.reshape(-1)
+    G = torch.stack([g_u_flat, g_m_flat], dim=1)
+    C = torch.matmul(G.T, G)
+    det = C[0, 0] * C[1, 1] - C[0, 1] * C[1, 0]
+    return torch.sqrt(torch.abs(det) + 1e-8)
+
 def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, total_epochs, tqdm_able):
+    global DEBUG_GGDM_ONCE
     net.train()
     sample_count = 0
     running_loss = 0.
@@ -68,14 +81,61 @@ def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, to
     with tqdm(train_loader, desc=f"Training epoch {current_epoch}/{total_epochs}", leave=False, unit="batch", disable=tqdm_able) as pbar:
         for x, y, mask in pbar:
             x, y, mask = x.to(device), y.to(device).unsqueeze(1), mask.to(device)
-            y_pred = net(x, mask)
-            loss = loss_fn(y_pred, y.to(torch.float32))
-            loss.backward()
-            optimizer.step()
+            y_float = y.to(torch.float32)
+            out_m, out_a, out_v, x_a, x_v, x_a_orig, x_v_orig = net(x, mask)
+            loss_m = loss_fn(out_m, y_float)
+            loss_a = loss_fn(out_a, y_float)
+            loss_v = loss_fn(out_v, y_float)
             optimizer.zero_grad()
+
+            loss_m.backward(retain_graph=True)
+            g_a_m = x_a.grad.clone()
+            g_v_m = x_v.grad.clone()
+            x_a.grad.zero_()
+            x_v.grad.zero_()
+
+            loss_a.backward(retain_graph=True)
+            g_a_u = x_a.grad.clone()
+            x_a.grad.zero_()
+
+            loss_v.backward()
+            g_v_u = x_v.grad.clone()
+            x_v.grad.zero_()
+
+            V_a = calc_volume(g_a_u, g_a_m)
+            V_v = calc_volume(g_v_u, g_v_m)
+            rho_a = V_a / (V_a + V_v + 1e-8)
+            rho_v = V_v / (V_a + V_v + 1e-8)
+            alpha_a = 1.0 - torch.tanh(torch.relu(rho_a))
+            alpha_v = 1.0 - torch.tanh(torch.relu(rho_v))
+            h_a_final = alpha_a * (g_a_u + g_a_m)
+            h_v_final = alpha_v * (g_v_u + g_v_m)
+
+            if DEBUG_GGDM_ONCE:
+                print("\n" + "=" * 50)
+                print("[GGDM Debug] 防止 Silent Failure 的完整性自检开启！")
+                model_ref = _unwrap_model(net)
+                cossm_param = next(model_ref.cossm_encoder.parameters())
+                if cossm_param.grad is not None and cossm_param.grad.abs().sum() > 0:
+                    raise RuntimeError("【致命错误】梯度提前泄漏到了 CoSSM！Graph Detach 失败！")
+                print("✅ 检查通过: 原始梯度未泄露到 CoSSM。底层网络安全！")
+                enssm_param = next(model_ref.enssm_encoder.parameters())
+                if enssm_param.grad is None or enssm_param.grad.abs().sum() == 0:
+                    raise RuntimeError("【致命错误】顶层 EnSSM 没有拿到梯度！")
+                print("✅ 检查通过: EnSSM 及裁判分类器正常获取到原始梯度。")
+                print(f"📊 梯度体积: V_audio = {V_a.item():.4e}, V_video = {V_v.item():.4e}")
+                print(f"⚖️  不平衡度: rho_a = {rho_a.item():.4f}, rho_v = {rho_v.item():.4f}")
+                print(f"⚙️  调制系数: alpha_a = {alpha_a.item():.4f}, alpha_v = {alpha_v.item():.4f}")
+                print("=" * 50 + "\n")
+                DEBUG_GGDM_ONCE = False
+
+            x_a_orig.backward(h_a_final, retain_graph=True)
+            x_v_orig.backward(h_v_final)
+            optimizer.step()
             sample_count += x.shape[0]
-            running_loss += loss.item() * x.shape[0]
-            pred = (y_pred > 0.).int()
+            total_loss = loss_m + loss_a + loss_v
+            running_loss += total_loss.item() * x.shape[0]
+            pred = (out_m > 0.).int()
             correct_count += (pred == y).sum().item()
             pbar.set_postfix({"loss": running_loss / sample_count, "acc": correct_count / sample_count,})
     return {"loss": running_loss / sample_count, "acc": correct_count / sample_count,}
