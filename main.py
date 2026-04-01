@@ -78,6 +78,14 @@ def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, to
     sample_count = 0
     running_loss = 0.
     correct_count = 0
+    
+    # ==============================================================
+    # [GGDM 追踪] 初始化 Epoch 级别的度量累加器
+    # ==============================================================
+    total_rho_a, total_rho_v = 0.0, 0.0
+    total_alpha_a, total_alpha_v = 0.0, 0.0
+    num_batches = len(train_loader)
+
     with tqdm(train_loader, desc=f"Training epoch {current_epoch}/{total_epochs}", leave=False, unit="batch", disable=tqdm_able) as pbar:
         for x, y, mask in pbar:
             x, y, mask = x.to(device), y.to(device).unsqueeze(1), mask.to(device)
@@ -104,12 +112,27 @@ def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, to
 
             V_a = calc_volume(g_a_u, g_a_m)
             V_v = calc_volume(g_v_u, g_v_m)
+            
             rho_a = V_a / (V_a + V_v + 1e-8)
             rho_v = V_v / (V_a + V_v + 1e-8)
-            alpha_a = 1.0 - torch.tanh(torch.relu(rho_a))
-            alpha_v = 1.0 - torch.tanh(torch.relu(rho_v))
+            
+            # ==============================================================
+            # [GGDM 核心升级] Margin-based Relaxation (松弛惩罚)
+            # 设置 margin=0.5。只有当某个模态的体积占比超过 50% 时，才会受到打压。
+            # 这样在 50:50 完美平衡时，alpha 会保持为 1.0 (全速学习)！
+            # ==============================================================
+            margin = 0.5
+            alpha_a = 1.0 - torch.tanh(torch.relu(rho_a - margin))
+            alpha_v = 1.0 - torch.tanh(torch.relu(rho_v - margin))
+            
             h_a_final = alpha_a * (g_a_u + g_a_m)
             h_v_final = alpha_v * (g_v_u + g_v_m)
+
+            # [GGDM 追踪] 累加当前 batch 的不平衡度和调制系数
+            total_rho_a += rho_a.item()
+            total_rho_v += rho_v.item()
+            total_alpha_a += alpha_a.item()
+            total_alpha_v += alpha_v.item()
 
             if DEBUG_GGDM_ONCE:
                 print("\n" + "=" * 50)
@@ -137,8 +160,28 @@ def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, to
             running_loss += total_loss.item() * x.shape[0]
             pred = (out_m > 0.).int()
             correct_count += (pred == y).sum().item()
-            pbar.set_postfix({"loss": running_loss / sample_count, "acc": correct_count / sample_count,})
-    return {"loss": running_loss / sample_count, "acc": correct_count / sample_count,}
+            pbar.set_postfix({"loss": running_loss / sample_count, "acc": correct_count / sample_count})
+            
+    # ==============================================================
+    # [GGDM 追踪] 计算并打印当前 Epoch 的平均几何指标
+    # ==============================================================
+    avg_rho_a = total_rho_a / num_batches
+    avg_rho_v = total_rho_v / num_batches
+    avg_alpha_a = total_alpha_a / num_batches
+    avg_alpha_v = total_alpha_v / num_batches
+    
+    # 终端实时播报，方便你随时监控模型偏科情况
+    print(f"\n[Epoch {current_epoch} GGDM Stats] ⚖️ Rho: Audio={avg_rho_a:.4f}, Video={avg_rho_v:.4f} | ⚙️ Alpha: Audio={avg_alpha_a:.4f}, Video={avg_alpha_v:.4f}")
+
+    # 将指标加入返回字典，交由外层 main 函数记录到 WandB
+    return {
+        "loss": running_loss / sample_count, 
+        "acc": correct_count / sample_count,
+        "rho_a": avg_rho_a,
+        "rho_v": avg_rho_v,
+        "alpha_a": avg_alpha_a,
+        "alpha_v": avg_alpha_v
+    }
 
 def val(net, val_loader, loss_fn, device, tqdm_able):
     net.eval()
@@ -235,11 +278,30 @@ def main():
                 train_results = train_epoch(net, train_loader, loss_fn, optimizer, args.device[0], epoch, args.epochs, args.tqdm_able)
                 val_results = val(net, val_loader, loss_fn, args.device[0],args.tqdm_able)
                 val_acc = (val_results["acc"] + val_results["precision"]+ val_results["recall"]+ val_results["f1"])/4.0
+                
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
                     torch.save(net.state_dict(),f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt")
+                
+                # ==============================================================
+                # [GGDM 追踪] 将追踪指标传送到 WandB，构建你的论文配图数据源！
+                # ==============================================================
                 if args.if_wandb:
-                    wandb.log({"loss/train": train_results["loss"], "acc/train": train_results["acc"], "loss/val": val_results["loss"], "acc/val": val_results["acc"], "precision/val": val_results["precision"], "recall/val": val_results["recall"], "f1/val": val_results["f1"]})
+                    wandb.log({
+                        "epoch": epoch,
+                        "loss/train": train_results["loss"], 
+                        "acc/train": train_results["acc"], 
+                        "loss/val": val_results["loss"], 
+                        "acc/val": val_results["acc"], 
+                        "precision/val": val_results["precision"], 
+                        "recall/val": val_results["recall"], 
+                        "f1/val": val_results["f1"],
+                        # 新增的核心追踪面板：
+                        f"GGDM_Tracking_Iter{i_iter}/rho_audio": train_results["rho_a"],
+                        f"GGDM_Tracking_Iter{i_iter}/rho_video": train_results["rho_v"],
+                        f"GGDM_Tracking_Iter{i_iter}/alpha_audio": train_results["alpha_a"],
+                        f"GGDM_Tracking_Iter{i_iter}/alpha_video": train_results["alpha_v"]
+                    })
                     
         with torch.no_grad():
             net.load_state_dict(torch.load(f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt", map_location=args.device[0]))
