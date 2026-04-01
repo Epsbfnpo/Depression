@@ -178,12 +178,16 @@ class ImprovedMoERouter(nn.Module):
         hidden_dim = max(1, input_dim // 4)
         self.temporal_conv = nn.Conv1d(input_dim, conv_dim, kernel_size=3, padding=1)
         self.relu = nn.ReLU()
+        self.norm = LayerNorm(conv_dim, eps=1e-6)
         self.router_network = nn.Sequential(
             nn.Linear(conv_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, num_experts),
         )
         self.temperature = 1.0
+        self._debug_printed = False
+        nn.init.normal_(self.router_network[-1].weight, std=0.01)
+        nn.init.zeros_(self.router_network[-1].bias)
 
     def forward(self, x, padding_mask=None):
         x_t = x.permute(0, 2, 1)
@@ -193,9 +197,13 @@ class ImprovedMoERouter(nn.Module):
             x_pooled = (x_t * mask).sum(dim=2) / (mask.sum(dim=2) + 1e-8)
         else:
             x_pooled = x_t.mean(dim=2)
+        x_pooled = self.norm(x_pooled)
         logits = self.router_network(x_pooled)
         if self.training:
             noise = -torch.log(-torch.log(torch.rand_like(logits) + 1e-8) + 1e-8)
+            if not self._debug_printed:
+                print(f"\n[DEBUG ROUTER] Logits std: {logits.std().item():.4f}, Noise applied: 0.5")
+                self._debug_printed = True
             logits = logits + noise * 0.5
         return F.softmax(logits / self.temperature, dim=-1)
 
@@ -303,7 +311,7 @@ class DepMamba(BaseNet):
             x = moe_outputs[0]
             aux_a = moe_outputs[1] if len(moe_outputs) > 1 else None
             aux_v = moe_outputs[2] if len(moe_outputs) > 2 else None
-            weights = moe_outputs[3] if len(moe_outputs) > 3 else None
+            weights = moe_outputs[4] if len(moe_outputs) > 4 else None
         else:
             x, aux_a, aux_v, weights = moe_outputs, None, None, None
 
