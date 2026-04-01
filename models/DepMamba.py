@@ -178,6 +178,7 @@ class ImprovedMoERouter(nn.Module):
         hidden_dim = max(1, input_dim // 4)
         self.temporal_conv = nn.Conv1d(input_dim, conv_dim, kernel_size=3, padding=1)
         self.relu = nn.ReLU()
+        self.norm = LayerNorm(conv_dim, eps=1e-6)
         self.router_network = nn.Sequential(
             nn.Linear(conv_dim, hidden_dim),
             nn.ReLU(),
@@ -185,6 +186,8 @@ class ImprovedMoERouter(nn.Module):
         )
         self.temperature = 1.0
         self._debug_printed = False
+        nn.init.normal_(self.router_network[-1].weight, std=0.01)
+        nn.init.zeros_(self.router_network[-1].bias)
 
     def forward(self, x, padding_mask=None):
         x_t = x.permute(0, 2, 1)
@@ -194,6 +197,7 @@ class ImprovedMoERouter(nn.Module):
             x_pooled = (x_t * mask).sum(dim=2) / (mask.sum(dim=2) + 1e-8)
         else:
             x_pooled = x_t.mean(dim=2)
+        x_pooled = self.norm(x_pooled)
         logits = self.router_network(x_pooled)
         if self.training:
             noise = -torch.log(-torch.log(torch.rand_like(logits) + 1e-8) + 1e-8)
