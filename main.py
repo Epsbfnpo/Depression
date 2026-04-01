@@ -75,7 +75,7 @@ def train_epoch(net, train_loader, criterion_main, optimizer, device, current_ep
     running_loss = 0.
     correct_count = 0
     with tqdm(train_loader, desc=f"Training epoch {current_epoch}/{total_epochs}", leave=False, unit="batch", disable=tqdm_able) as pbar:
-        for x, y, mask in pbar:
+        for batch_idx, (x, y, mask) in enumerate(pbar):
             x, y, mask = x.to(device), y.to(device).unsqueeze(1), mask.to(device)
             y_target = y.to(torch.float32).squeeze(1)
             optimizer.zero_grad()
@@ -87,9 +87,31 @@ def train_epoch(net, train_loader, criterion_main, optimizer, device, current_ep
             mean_router_prob = weights.mean(dim=0)
             ideal_prob = torch.ones_like(mean_router_prob) / 3.0
             loss_balance = F.mse_loss(mean_router_prob, ideal_prob)
-            loss = loss_main + aux_weight * (loss_aux_a + loss_aux_v) + bal_weight * loss_balance
+            w_aux_a = aux_weight * loss_aux_a
+            w_aux_v = aux_weight * loss_aux_v
+            w_bal = bal_weight * loss_balance
+            loss = loss_main + w_aux_a + w_aux_v + w_bal
 
             loss.backward()
+
+            if batch_idx == 0 and (current_epoch == 0 or current_epoch == 10):
+                print(f"\n--- [Silent Failure Check @ Epoch {current_epoch}] ---")
+                print(f"1. Loss Scale (Unweighted): Main={loss_main.item():.4f}, AuxA={loss_aux_a.item():.4f}, AuxV={loss_aux_v.item():.4f}, Balance={loss_balance.item():.4f}")
+                print(f"2. Loss Scale (Weighted)  : Main={loss_main.item():.4f}, Aux_Total={(w_aux_a + w_aux_v).item():.4f}, Balance={w_bal.item():.4f}")
+                print(f"3. Router Probabilities : Audio={mean_router_prob[0].item():.3f}, Video={mean_router_prob[1].item():.3f}, Fusion={mean_router_prob[2].item():.3f}")
+
+                if isinstance(net, torch.nn.DataParallel):
+                    router_layer = net.module.moe_enssm.router.router_network[-1]
+                else:
+                    router_layer = net.moe_enssm.router.router_network[-1]
+
+                if router_layer.weight.grad is not None:
+                    grad_norm = router_layer.weight.grad.norm().item()
+                    print(f"4. Router Gradient Norm : {grad_norm:.6f} (If 0.0, gradients are detached!)")
+                else:
+                    print("4. Router Gradient Norm : None (CRITICAL SILENT FAILURE: Gradients not flowing!)")
+                print("--------------------------------------------------")
+
             optimizer.step()
             sample_count += x.shape[0]
             running_loss += loss.item() * x.shape[0]

@@ -184,6 +184,7 @@ class ImprovedMoERouter(nn.Module):
             nn.Linear(hidden_dim, num_experts),
         )
         self.temperature = 1.0
+        self._debug_printed = False
 
     def forward(self, x, padding_mask=None):
         x_t = x.permute(0, 2, 1)
@@ -196,6 +197,9 @@ class ImprovedMoERouter(nn.Module):
         logits = self.router_network(x_pooled)
         if self.training:
             noise = -torch.log(-torch.log(torch.rand_like(logits) + 1e-8) + 1e-8)
+            if not self._debug_printed:
+                print(f"\n[DEBUG ROUTER] Logits std: {logits.std().item():.4f}, Noise applied: 0.5")
+                self._debug_printed = True
             logits = logits + noise * 0.5
         return F.softmax(logits / self.temperature, dim=-1)
 
@@ -303,7 +307,7 @@ class DepMamba(BaseNet):
             x = moe_outputs[0]
             aux_a = moe_outputs[1] if len(moe_outputs) > 1 else None
             aux_v = moe_outputs[2] if len(moe_outputs) > 2 else None
-            weights = moe_outputs[3] if len(moe_outputs) > 3 else None
+            weights = moe_outputs[4] if len(moe_outputs) > 4 else None
         else:
             x, aux_a, aux_v, weights = moe_outputs, None, None, None
 
