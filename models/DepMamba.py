@@ -170,7 +170,7 @@ class EnSSM(nn.Module):
         return out
 
 class MoERouter(nn.Module):
-    """Dynamic router that predicts per-sample expert weights."""
+    """Dynamic router with Gumbel noise exploration and temperature scaling."""
 
     def __init__(self, input_dim, num_experts=3):
         super().__init__()
@@ -180,18 +180,19 @@ class MoERouter(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, num_experts),
         )
+        self.temperature = 1.0
 
     def forward(self, x, padding_mask=None):
-        # x: [B, L, C]
         if padding_mask is not None:
             mask = padding_mask.unsqueeze(-1).float()
             x_pooled = (x * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
         else:
             x_pooled = x.mean(dim=1)
         logits = self.router_network(x_pooled)
-        logits = logits / (torch.norm(logits, dim=-1, keepdim=True) + 1e-8)
-        temperature = 1.5
-        return F.softmax(logits / temperature, dim=-1)
+        if self.training:
+            noise = -torch.log(-torch.log(torch.rand_like(logits) + 1e-8) + 1e-8)
+            logits = logits + noise
+        return F.softmax(logits / self.temperature, dim=-1)
 
 class MoEEnSSM(nn.Module):
     """MoE-enhanced fusion module with unimodal auxiliary heads."""
@@ -205,8 +206,9 @@ class MoEEnSSM(nn.Module):
         self.proj_a = nn.Linear(d_model_single, d_model_concat)
         self.proj_v = nn.Linear(d_model_single, d_model_concat)
         self.layer_norm = LayerNorm(d_model_concat, eps=1e-6)
-        self.aux_classifier_a = nn.Linear(d_model_single, 1)
-        self.aux_classifier_v = nn.Linear(d_model_single, 1)
+        self.head_a = nn.Linear(d_model_concat, 1)
+        self.head_v = nn.Linear(d_model_concat, 1)
+        self.head_f = nn.Linear(d_model_concat, 1)
 
     def forward(self, xa, xv, padding_mask=None):
         x_concat = torch.cat([xa, xv], dim=-1)
@@ -217,6 +219,7 @@ class MoEEnSSM(nn.Module):
         self.dbg_w_a = weights[:, 0].mean().item()
         self.dbg_w_v = weights[:, 1].mean().item()
         self.dbg_w_f = weights[:, 2].mean().item()
+        self.dbg_var_a = weights[:, 0].var().item()
 
         y_a = self.expert_audio(F.dropout(xa, p=0.3, training=self.training))
         y_v = self.expert_video(xv)
@@ -228,15 +231,18 @@ class MoEEnSSM(nn.Module):
 
         if padding_mask is not None:
             mask = padding_mask.unsqueeze(-1).float()
-            pool_a = (y_a * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
-            pool_v = (y_v * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
+            pool_a = (y_a_proj * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
+            pool_v = (y_v_proj * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
+            pool_f = (y_f * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
         else:
-            pool_a = y_a.mean(dim=1)
-            pool_v = y_v.mean(dim=1)
+            pool_a = y_a_proj.mean(dim=1)
+            pool_v = y_v_proj.mean(dim=1)
+            pool_f = y_f.mean(dim=1)
 
-        aux_logits_a = self.aux_classifier_a(pool_a).squeeze(-1)
-        aux_logits_v = self.aux_classifier_v(pool_v).squeeze(-1)
-        return out_fused, aux_logits_a, aux_logits_v, weights
+        logits_a = self.head_a(pool_a).squeeze(-1)
+        logits_v = self.head_v(pool_v).squeeze(-1)
+        logits_f_expert = self.head_f(pool_f).squeeze(-1)
+        return out_fused, logits_a, logits_v, logits_f_expert, weights, pool_a, pool_v, pool_f
 
 class DepMamba(BaseNet):
     def __init__(self, audio_input_size=161, video_input_size=161, mm_input_size=128, mm_output_sizes=[256,64], d_ffn=1024, num_layers=8, dropout=0.1, activation='Swish', causal=False, mamba_config=None):
@@ -248,9 +254,13 @@ class DepMamba(BaseNet):
         self.pool = nn.AdaptiveMaxPool1d(1)
         self.classifier_drop = nn.Dropout(0.5)
         self.output = nn.Linear(mm_output_sizes[-1]*2, 1)
-        self.current_aux_a = None
-        self.current_aux_v = None
+        self.expert_logits_a = None
+        self.expert_logits_v = None
+        self.expert_logits_f = None
         self.current_weights = None
+        self.pool_a = None
+        self.pool_v = None
+        self.pool_f = None
         nn.init.xavier_uniform_(self.conv_audio.weight.data)
         nn.init.xavier_uniform_(self.conv_video.weight.data)
         nn.init.zeros_(self.output.bias)
@@ -261,10 +271,14 @@ class DepMamba(BaseNet):
         xa = self.conv_audio(xa.permute(0,2,1)).permute(0,2,1)
         xv = self.conv_video(xv.permute(0,2,1)).permute(0,2,1)
         xa, xv = self.cossm_encoder(xa, xv, a_inference_params, v_inference_params)
-        x, aux_a, aux_v, weights = self.moe_enssm(xa, xv, padding_mask)
-        self.current_aux_a = aux_a
-        self.current_aux_v = aux_v
+        x, logits_a, logits_v, logits_f, weights, pool_a, pool_v, pool_f = self.moe_enssm(xa, xv, padding_mask)
+        self.expert_logits_a = logits_a
+        self.expert_logits_v = logits_v
+        self.expert_logits_f = logits_f
         self.current_weights = weights
+        self.pool_a = pool_a
+        self.pool_v = pool_v
+        self.pool_f = pool_f
         if padding_mask is not None:
             x = x * (padding_mask.unsqueeze(-1).float())
             x = x.sum(dim=1) / (padding_mask.unsqueeze(-1).float()).sum(dim=1, keepdim=False)
@@ -277,14 +291,14 @@ class DepMamba(BaseNet):
         return self.output(x)
 
     def forward(self, x, padding_mask=None, **kwargs):
-        x = self.feature_extractor(x, padding_mask)
-        out = self.output(x).squeeze(-1)
+        x_fused = self.feature_extractor(x, padding_mask)
+        out_main = self.output(x_fused).squeeze(-1)
         if self.training:
-            return out, self.current_aux_a, self.current_aux_v, self.current_weights
+            return out_main, self.expert_logits_a, self.expert_logits_v, self.expert_logits_f, self.current_weights, self.pool_a, self.pool_v, self.pool_f
         try:
             w_a = self.moe_enssm.dbg_w_a
             w_v = self.moe_enssm.dbg_w_v
-            w_f = self.moe_enssm.dbg_w_f
+            w_var_a = self.moe_enssm.dbg_var_a
         except Exception:
-            w_a, w_v, w_f = -1.0, -1.0, -1.0
-        return out, out.new_tensor(w_a), out.new_tensor(w_v), out.new_tensor(w_f)
+            w_a, w_v, w_var_a = -1.0, -1.0, -1.0
+        return out_main, out_main.new_tensor(w_a), out_main.new_tensor(w_v), out_main.new_tensor(w_var_a)
