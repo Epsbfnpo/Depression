@@ -292,6 +292,7 @@ class DepMamba(BaseNet):
         nn.init.zeros_(self.output.bias)
 
     def feature_extractor(self, x, padding_mask=None, a_inference_params = None, v_inference_params = None):
+        pool_a, pool_v, pool_f = None, None, None
         xa = x[:, :, 136:]
         xv = x[:, :, :136]
         xa = self.conv_audio(xa.permute(0,2,1)).permute(0,2,1)
