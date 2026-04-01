@@ -230,8 +230,9 @@ class LightweightMoE(nn.Module):
         self.proj_a = nn.Linear(d_model_single, d_model_concat)
         self.proj_v = nn.Linear(d_model_single, d_model_concat)
         self.layer_norm = LayerNorm(d_model_concat, eps=1e-6)
-        self.aux_classifier_a = nn.Linear(d_model_single, 1)
-        self.aux_classifier_v = nn.Linear(d_model_single, 1)
+        self.head_a = nn.Linear(d_model_concat, 1)
+        self.head_v = nn.Linear(d_model_concat, 1)
+        self.head_f = nn.Linear(d_model_concat, 1)
 
     def forward(self, xa, xv, padding_mask=None):
         x_concat = torch.cat([xa, xv], dim=-1)
@@ -256,15 +257,18 @@ class LightweightMoE(nn.Module):
 
         if padding_mask is not None:
             mask = padding_mask.unsqueeze(-1).float()
-            pool_a = (y_a * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
-            pool_v = (y_v * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
+            pool_a = (y_a_proj * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
+            pool_v = (y_v_proj * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
+            pool_f = (y_f * mask).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
         else:
-            pool_a = y_a.mean(dim=1)
-            pool_v = y_v.mean(dim=1)
+            pool_a = y_a_proj.mean(dim=1)
+            pool_v = y_v_proj.mean(dim=1)
+            pool_f = y_f.mean(dim=1)
 
-        aux_logits_a = self.aux_classifier_a(pool_a).squeeze(-1)
-        aux_logits_v = self.aux_classifier_v(pool_v).squeeze(-1)
-        return out_fused, aux_logits_a, aux_logits_v, weights
+        logits_a = self.head_a(pool_a).squeeze(-1)
+        logits_v = self.head_v(pool_v).squeeze(-1)
+        logits_f_expert = self.head_f(pool_f).squeeze(-1)
+        return out_fused, logits_a, logits_v, logits_f_expert, weights, pool_a, pool_v, pool_f
 
 class DepMamba(BaseNet):
     def __init__(self, audio_input_size=161, video_input_size=161, mm_input_size=128, mm_output_sizes=[256,64], d_ffn=1024, num_layers=8, dropout=0.1, activation='Swish', causal=False, mamba_config=None):
@@ -276,9 +280,13 @@ class DepMamba(BaseNet):
         self.pool = nn.AdaptiveMaxPool1d(1)
         self.classifier_drop = nn.Dropout(0.5)
         self.output = nn.Linear(mm_output_sizes[-1]*2, 1)
-        self.current_aux_a = None
-        self.current_aux_v = None
+        self.expert_logits_a = None
+        self.expert_logits_v = None
+        self.expert_logits_f = None
         self.current_weights = None
+        self.pool_a = None
+        self.pool_v = None
+        self.pool_f = None
         nn.init.xavier_uniform_(self.conv_audio.weight.data)
         nn.init.xavier_uniform_(self.conv_video.weight.data)
         nn.init.zeros_(self.output.bias)
@@ -289,10 +297,14 @@ class DepMamba(BaseNet):
         xa = self.conv_audio(xa.permute(0,2,1)).permute(0,2,1)
         xv = self.conv_video(xv.permute(0,2,1)).permute(0,2,1)
         xa, xv = self.cossm_encoder(xa, xv, a_inference_params, v_inference_params)
-        x, aux_a, aux_v, weights = self.moe_enssm(xa, xv, padding_mask)
-        self.current_aux_a = aux_a
-        self.current_aux_v = aux_v
+        x, logits_a, logits_v, logits_f, weights, pool_a, pool_v, pool_f = self.moe_enssm(xa, xv, padding_mask)
+        self.expert_logits_a = logits_a
+        self.expert_logits_v = logits_v
+        self.expert_logits_f = logits_f
         self.current_weights = weights
+        self.pool_a = pool_a
+        self.pool_v = pool_v
+        self.pool_f = pool_f
         if padding_mask is not None:
             x = x * (padding_mask.unsqueeze(-1).float())
             x = x.sum(dim=1) / (padding_mask.unsqueeze(-1).float()).sum(dim=1, keepdim=False)
