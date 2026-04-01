@@ -5,6 +5,7 @@ import numpy as np
 import yaml
 import wandb
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 from models import DepMamba
 from datasets import get_dvlog_dataloader, get_lmvd_dataloader
@@ -64,7 +65,11 @@ def _parse_gpu_arg(gpu_arg: str):
     ids = [int(x) for x in s.split(",") if x != ""]
     return ids
 
-def train_epoch(net, train_loader, criterion_main, criterion_expert, optimizer, device, current_epoch, total_epochs, tqdm_able):
+def smooth_labels(targets, smoothing=0.1):
+    return targets * (1.0 - smoothing) + 0.5 * smoothing
+
+
+def train_epoch(net, train_loader, criterion_main, optimizer, device, current_epoch, total_epochs, tqdm_able, aux_weight=0.05, bal_weight=0.1):
     net.train()
     sample_count = 0
     running_loss = 0.
@@ -74,38 +79,15 @@ def train_epoch(net, train_loader, criterion_main, criterion_expert, optimizer, 
             x, y, mask = x.to(device), y.to(device).unsqueeze(1), mask.to(device)
             y_target = y.to(torch.float32).squeeze(1)
             optimizer.zero_grad()
-            out_main, logits_a, logits_v, logits_f, weights, feat_a, feat_v, feat_f = net(x, mask)
-            loss_main = criterion_main(out_main, y_target)
-
-            loss_a_batch = criterion_expert(logits_a, y_target)
-            loss_v_batch = criterion_expert(logits_v, y_target)
-            loss_f_batch = criterion_expert(logits_f, y_target)
-            loss_aux = loss_a_batch.mean() + loss_v_batch.mean() + loss_f_batch.mean()
-
-            inv_losses = torch.stack(
-                [
-                    1.0 / (loss_a_batch.detach() + 0.1),
-                    1.0 / (loss_v_batch.detach() + 0.1),
-                    1.0 / (loss_f_batch.detach() + 0.1),
-                ],
-                dim=1,
-            )
-            dist = inv_losses / (inv_losses.sum(dim=1, keepdim=True) + 1e-8)
-            loss_sim = torch.mean((dist.detach() - weights) ** 2)
-
-            mean_w = weights.mean(dim=0)
-            loss_balance = torch.sum((mean_w - 1.0 / 3.0) ** 2)
-
-            teacher_feats = (
-                feat_a * weights[:, 0].unsqueeze(1) + feat_v * weights[:, 1].unsqueeze(1)
-            ).detach()
-            loss_ud = torch.nn.functional.mse_loss(feat_f, teacher_feats)
-
-            alpha_aux = 0.1
-            beta_sim = 0.5
-            gamma_bal = 0.1
-            delta_ud = 0.1
-            loss = loss_main + alpha_aux * loss_aux + beta_sim * loss_sim + gamma_bal * loss_balance + delta_ud * loss_ud
+            out_main, aux_a, aux_v, weights = net(x, mask)
+            smoothed_targets = smooth_labels(y_target, smoothing=0.15)
+            loss_main = criterion_main(out_main, smoothed_targets)
+            loss_aux_a = criterion_main(aux_a, smoothed_targets)
+            loss_aux_v = criterion_main(aux_v, smoothed_targets)
+            mean_router_prob = weights.mean(dim=0)
+            ideal_prob = torch.ones_like(mean_router_prob) / 3.0
+            loss_balance = F.mse_loss(mean_router_prob, ideal_prob)
+            loss = loss_main + aux_weight * (loss_aux_a + loss_aux_v) + bal_weight * loss_balance
 
             loss.backward()
             optimizer.step()
@@ -115,10 +97,9 @@ def train_epoch(net, train_loader, criterion_main, criterion_expert, optimizer, 
             correct_count += (pred == y.squeeze(1)).sum().item()
             pbar.set_postfix({
                 "L_M": f"{loss_main.item():.2f}",
-                "L_Aux": f"{loss_aux.item():.2f}",
-                "L_Sim": f"{loss_sim.item():.2f}",
+                "L_A": f"{loss_aux_a.item():.2f}",
+                "L_V": f"{loss_aux_v.item():.2f}",
                 "L_Bal": f"{loss_balance.item():.2f}",
-                "L_UD": f"{loss_ud.item():.2f}",
                 "acc": f"{correct_count / sample_count:.2f}",
             })
     return {"loss": running_loss / sample_count, "acc": correct_count / sample_count,}
@@ -215,13 +196,7 @@ def main():
             train_loader = get_lmvd_dataloader(args.data_dir, "train", args.batch_size, args.train_gender)
             val_loader = get_lmvd_dataloader(args.data_dir, "valid", args.batch_size, args.test_gender)
             test_loader = get_lmvd_dataloader(args.data_dir, "test", args.batch_size, args.test_gender)
-        if args.dataset == 'dvlog':
-            neg_count, pos_count = 477.0, 771.0
-        else:
-            neg_count, pos_count = 477.0, 771.0
-        pos_weight_val = torch.tensor([neg_count / max(pos_count, 1.0)], device=args.device[0])
-        criterion_main = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight_val)
-        criterion_expert = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight_val, reduction='none')
+        criterion_main = torch.nn.BCEWithLogitsLoss()
         router_lr = args.router_learning_rate if args.router_learning_rate is not None else args.learning_rate
         named_params = list(net.named_parameters())
         router_params = [p for n, p in named_params if "moe_enssm.router" in n]
@@ -241,12 +216,13 @@ def main():
                     net,
                     train_loader,
                     criterion_main,
-                    criterion_expert,
                     optimizer,
                     args.device[0],
                     epoch,
                     args.epochs,
                     args.tqdm_able,
+                    aux_weight=args.aux_weight,
+                    bal_weight=max(args.bal_weight, 0.1),
                 )
                 val_results = val(net, val_loader, criterion_main, args.device[0],args.tqdm_able)
                 val_acc = (val_results["acc"] + val_results["precision"]+ val_results["recall"]+ val_results["f1"])/4.0
