@@ -43,7 +43,7 @@ def parse_args():
     parser.add_argument("-e", "--epochs", type=int)
     parser.add_argument("-bs", "--batch_size", type=int)
     parser.add_argument("-lr", "--learning_rate", type=float)
-    parser.add_argument("--aux_weight", type=float, default=0.0)
+    parser.add_argument("--aux_weight", type=float, default=0.05)
     parser.add_argument("--bal_weight", type=float, default=0.02)
     parser.add_argument("--router_learning_rate", type=float)
     parser.add_argument("--weight_decay", type=float, default=1e-2)
@@ -64,7 +64,7 @@ def _parse_gpu_arg(gpu_arg: str):
     ids = [int(x) for x in s.split(",") if x != ""]
     return ids
 
-def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, total_epochs, tqdm_able, aux_weight=0.0, bal_weight=0.02):
+def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, total_epochs, tqdm_able, aux_weight=0.05, bal_weight=0.02):
     net.train()
     sample_count = 0
     running_loss = 0.
@@ -73,10 +73,11 @@ def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, to
         for x, y, mask in pbar:
             x, y, mask = x.to(device), y.to(device).unsqueeze(1), mask.to(device)
             y_target = y.to(torch.float32).squeeze(1)
+            y_target_smoothed = y_target * 0.8 + 0.1
             y_pred, aux_a, aux_v, weights = net(x, mask)
-            loss_main = loss_fn(y_pred, y_target)
-            loss_a = loss_fn(aux_a, y_target)
-            loss_v = loss_fn(aux_v, y_target)
+            loss_main = loss_fn(y_pred, y_target_smoothed)
+            loss_a = loss_fn(aux_a, y_target_smoothed)
+            loss_v = loss_fn(aux_v, y_target_smoothed)
             f = weights.mean(dim=0)
             loss_bal = (f.std() / (f.mean() + 1e-8)).pow(2)
             loss = loss_main + aux_weight * (loss_a + loss_v) + bal_weight * loss_bal

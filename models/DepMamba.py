@@ -253,6 +253,7 @@ class DepMamba(BaseNet):
         self.current_weights = None
         nn.init.xavier_uniform_(self.conv_audio.weight.data)
         nn.init.xavier_uniform_(self.conv_video.weight.data)
+        nn.init.zeros_(self.output.bias)
 
     def feature_extractor(self, x, padding_mask=None, a_inference_params = None, v_inference_params = None):
         xa = x[:, :, 136:]

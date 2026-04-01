@@ -9,7 +9,7 @@ epochs: 120
 batch_size: 16
 learning_rate: 8e-5
 router_learning_rate: 8e-5
-aux_weight: 0.0
+aux_weight: 0.05
 bal_weight: 0.02
 weight_decay: 1e-2
 # audio_dropout is fixed to 0.3 in MoE audio expert input (models/DepMamba.py)
