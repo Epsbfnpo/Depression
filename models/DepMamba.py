@@ -172,22 +172,29 @@ class EnSSM(nn.Module):
 class DepMamba(BaseNet):
     def __init__(self, audio_input_size=161, video_input_size=161, mm_input_size=128, mm_output_sizes=[256,64], d_ffn=1024, num_layers=8, dropout=0.1, activation='Swish', causal=False, mamba_config=None):
         super().__init__()
+        self.hidden_dim = mm_output_sizes[-1]
         self.cossm_encoder = CoSSM(num_layers, mm_input_size, mm_output_sizes, d_ffn, activation=activation, dropout=dropout, causal=causal, mamba_config=mamba_config)
         self.conv_audio = nn.Conv1d(audio_input_size, mm_input_size, 1, padding=0, dilation=1, bias=False)
         self.conv_video = nn.Conv1d(video_input_size, mm_input_size, 1, padding=0, dilation=1, bias=False)
         self.enssm_encoder = EnSSM(num_layers, mm_output_sizes[-1]*2, [mm_output_sizes[-1]*2], d_ffn, activation=activation, dropout=dropout, causal=causal, mamba_config=mamba_config)
+        self.aux_cls_a = nn.Linear(self.hidden_dim, 1)
+        self.aux_cls_v = nn.Linear(self.hidden_dim, 1)
         self.pool = nn.AdaptiveMaxPool1d(1)
         self.output = nn.Linear(mm_output_sizes[-1]*2, 1)
         self.m = nn.Sigmoid()
         nn.init.xavier_uniform_(self.conv_audio.weight.data)
         nn.init.xavier_uniform_(self.conv_video.weight.data)
 
-    def feature_extractor(self, x, padding_mask=None, a_inference_params = None, v_inference_params = None):
+    def extract_modality_features(self, x, a_inference_params = None, v_inference_params = None):
         xa = x[:, :, 136:]
         xv = x[:, :, :136]
         xa = self.conv_audio(xa.permute(0,2,1)).permute(0,2,1)
         xv = self.conv_video(xv.permute(0,2,1)).permute(0,2,1)
         xa, xv = self.cossm_encoder(xa, xv, a_inference_params, v_inference_params)
+        return xa, xv
+
+    def feature_extractor(self, x, padding_mask=None, a_inference_params = None, v_inference_params = None):
+        xa, xv = self.extract_modality_features(x, a_inference_params, v_inference_params)
         x = torch.cat([xa,xv],dim=-1)
         x = self.enssm_encoder(x)
         if padding_mask is not None:
@@ -199,3 +206,28 @@ class DepMamba(BaseNet):
 
     def classifier(self, x):
         return self.output(x)
+
+    def forward(self, x, mask=None):
+        xa_orig, xv_orig = self.extract_modality_features(x)
+
+        if self.training:
+            xa = xa_orig.detach().requires_grad_(True)
+            xv = xv_orig.detach().requires_grad_(True)
+        else:
+            xa, xv = xa_orig, xv_orig
+
+        out_a_aux = self.aux_cls_a(xa.mean(dim=1))
+        out_v_aux = self.aux_cls_v(xv.mean(dim=1))
+
+        x = torch.cat([xa, xv], dim=-1)
+        out_enssm = self.enssm_encoder(x)
+        if mask is not None:
+            out_enssm = out_enssm * (mask.unsqueeze(-1).float())
+            pooled = out_enssm.sum(dim=1) / (mask.unsqueeze(-1).float()).sum(dim=1, keepdim=False)
+        else:
+            pooled = self.pool(out_enssm.permute(0, 2, 1)).squeeze(-1)
+        out_m = self.classifier(pooled)
+
+        if self.training:
+            return out_m, out_a_aux, out_v_aux, xa, xv, xa_orig, xv_orig
+        return out_m
