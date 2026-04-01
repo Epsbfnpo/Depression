@@ -297,10 +297,24 @@ class DepMamba(BaseNet):
         xa = self.conv_audio(xa.permute(0,2,1)).permute(0,2,1)
         xv = self.conv_video(xv.permute(0,2,1)).permute(0,2,1)
         xa, xv = self.cossm_encoder(xa, xv, a_inference_params, v_inference_params)
-        x, logits_a, logits_v, logits_f, weights, pool_a, pool_v, pool_f = self.moe_enssm(xa, xv, padding_mask)
-        self.expert_logits_a = logits_a
-        self.expert_logits_v = logits_v
-        self.expert_logits_f = logits_f
+        moe_outputs = self.moe_enssm(xa, xv, padding_mask)
+        if isinstance(moe_outputs, (tuple, list)):
+            x = moe_outputs[0]
+            aux_a = moe_outputs[1] if len(moe_outputs) > 1 else None
+            aux_v = moe_outputs[2] if len(moe_outputs) > 2 else None
+            weights = moe_outputs[3] if len(moe_outputs) > 3 else None
+        else:
+            x, aux_a, aux_v, weights = moe_outputs, None, None, None
+
+        batch_size = x.size(0)
+        if aux_a is None:
+            aux_a = x.new_zeros(batch_size)
+        if aux_v is None:
+            aux_v = x.new_zeros(batch_size)
+        if weights is None:
+            weights = x.new_full((batch_size, 3), 1.0 / 3.0)
+        self.current_aux_a = aux_a
+        self.current_aux_v = aux_v
         self.current_weights = weights
         self.pool_a = pool_a
         self.pool_v = pool_v
