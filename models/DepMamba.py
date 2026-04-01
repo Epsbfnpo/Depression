@@ -311,16 +311,16 @@ class DepMamba(BaseNet):
         else:
             x = self.pool(x.permute(0,2,1)).squeeze(-1)
         x = self.classifier_drop(x)
-        return x
+        return x, aux_a, aux_v, weights
 
     def classifier(self, x):
         return self.output(x)
 
     def forward(self, x, padding_mask=None, **kwargs):
-        x_fused = self.feature_extractor(x, padding_mask)
+        x_fused, aux_a, aux_v, weights = self.feature_extractor(x, padding_mask)
         out_main = self.output(x_fused).squeeze(-1)
         if self.training:
-            return out_main, self.current_aux_a, self.current_aux_v, self.current_weights
+            return out_main, aux_a, aux_v, weights
         try:
             w_a = self.moe_enssm.dbg_w_a
             w_v = self.moe_enssm.dbg_w_v
