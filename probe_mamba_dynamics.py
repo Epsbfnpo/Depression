@@ -94,20 +94,22 @@ config = {
 model = DepMamba(**config).cuda().eval()
 
 # ==========================================
-# 步骤 3：构造时序病理测试用例 (超长冗余序列)
+# 步骤 3：构造时序病理测试用例 (三明治结构探针)
 # ==========================================
 batch_size = 1
 normal_T = 400
 stretch_factor = 5
 stretched_T = normal_T * stretch_factor # 2000 帧长序列
 
-# 构造数据：前 400 帧为有效信号，后 1600 帧完全是 0 (Padding 冗余)
-valid_signal = torch.randn(batch_size, normal_T, 136 + 128)
-redundant_signal = torch.zeros(batch_size, stretched_T - normal_T, 136 + 128)
-pathology_input = torch.cat([valid_signal, redundant_signal], dim=1).cuda()
+# 构造三明治数据：首尾是有效信号，中间是巨大的冗余黑洞
+valid_signal_start = torch.randn(batch_size, normal_T, 136 + 128)
+redundant_signal = torch.zeros(batch_size, stretched_T - normal_T - 200, 136 + 128) # 1400 帧冗余
+valid_signal_end = torch.randn(batch_size, 200, 136 + 128) # 末尾 200 帧的“强心针”唤醒刺激！
+
+pathology_input = torch.cat([valid_signal_start, redundant_signal, valid_signal_end], dim=1).cuda()
 mask = torch.ones(batch_size, stretched_T).cuda()
 
-print(f"[Probe] 开始向 DepMamba 注入长度为 {stretched_T} 的病理序列...")
+print(f"[Probe] 开始向 DepMamba 注入含有唤醒刺激的三明治病理序列...")
 
 with torch.no_grad():
     _ = model(pathology_input, mask)
@@ -143,6 +145,7 @@ plt.plot(range(1, stretched_T), delta_t, label='Delta_t (Norm Change Rate)', col
 
 plt.axvspan(0, normal_T, color='green', alpha=0.1, label='Normal Signal Zone')
 plt.axvspan(normal_T, stretched_T, color='red', alpha=0.1, label='Redundant Padding Zone')
+plt.axvspan(1800, 2000, color='orange', alpha=0.2, label='Wake-up Signal Zone')
 
 collapse_threshold = 1e-4
 plt.axhline(y=collapse_threshold, color='r', linestyle='--', label=f'Collapse Threshold ({collapse_threshold})')
