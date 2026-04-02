@@ -139,7 +139,7 @@ delta_t = delta_t.numpy()
 # 步骤 5：生成诊断图谱
 # ==========================================
 plt.figure(figsize=(12, 5))
-plt.plot(range(1, stretched_T), delta_t, label=r'$\\delta_t = \\frac{||h_t - h_{t-1}||_2}{||h_{t-1}||_2}$', color='b', linewidth=1.5)
+plt.plot(range(1, stretched_T), delta_t, label='Delta_t (Norm Change Rate)', color='b', linewidth=1.5)
 
 plt.axvspan(0, normal_T, color='green', alpha=0.1, label='Normal Signal Zone')
 plt.axvspan(normal_T, stretched_T, color='red', alpha=0.1, label='Redundant Padding Zone')
