@@ -7,25 +7,68 @@ from models.DepMamba import DepMamba
 import models.mamba.selective_scan_interface as selective_scan_interface
 
 # ==========================================
-# 步骤 1：构建 Monkey Patch，劫持底层 CUDA 状态
+# 核心重演引擎：在 CPU 上重构 Mamba 时序动力学
+# ==========================================
+def extract_hidden_states_pytorch(u, delta, A, B, C, delta_bias, delta_softplus):
+    """
+    通过拦截的输入，用纯 PyTorch 重演 Selective Scan，捕获每一帧的 h_t
+    """
+    # 转移到 CPU 并转为 float32 防止精度溢出
+    u = u.detach().cpu().float()
+    delta = delta.detach().cpu().float()
+    A = A.detach().cpu().float()
+    B = B.detach().cpu().float()
+    if delta_bias is not None:
+        delta_bias = delta_bias.detach().cpu().float()
+
+    batch, dim, seqlen = u.shape
+    dstate = A.shape[1]
+
+    # 1. 计算离散化步长 \Delta
+    if delta_bias is not None:
+        delta = delta + delta_bias.view(1, -1, 1)
+    if delta_softplus:
+        delta = torch.nn.functional.softplus(delta)
+
+    h = torch.zeros(batch, dim, dstate)
+    h_seq = []
+
+    # 2. 逐步推演动力学方程: h_t = dA * h_{t-1} + dB * x_t
+    for t in range(seqlen):
+        dt = delta[:, :, t] # [B, D]
+        dA = torch.exp(dt.unsqueeze(-1) * A) # [B, D, N]
+        
+        # B 的形状可能是 [B, N, L] 或 [B, G, N, L]
+        if B.dim() == 3:
+            B_t = B[:, :, t]
+            dB = dt.unsqueeze(-1) * B_t.unsqueeze(1) # [B, D, N]
+        else:
+            B_t = B[:, 0, :, t]
+            dB = dt.unsqueeze(-1) * B_t.unsqueeze(1)
+
+        u_t = u[:, :, t].unsqueeze(-1) # [B, D, 1]
+        
+        h = dA * h + dB * u_t # 更新隐藏状态
+        h_seq.append(h.clone())
+
+    # 返回形状: [Batch, Dim, SeqLen, DState]
+    return torch.stack(h_seq, dim=2)
+
+
+# ==========================================
+# 步骤 1：构建 Monkey Patch，劫持并重演
 # ==========================================
 original_cuda_fwd = selective_scan_interface.selective_scan_cuda.fwd
 hooked_states = []
 
 def patched_cuda_fwd(u, delta, A, B, C, D, z, delta_bias, delta_softplus):
-    # 1. 照常调用原始的底层 CUDA 函数
-    out, x, *rest = original_cuda_fwd(u, delta, A, B, C, D, z, delta_bias, delta_softplus)
-
-    # 2. 核心探针逻辑：提取中间状态
-    # 在底层的 C++ 实现中，x 的形状大致为 [batch, dim, seqlen, dstate_something]
-    # 根据 SelectiveScanFn 的源码，真实状态存在于 x[:, :, :, 1::2] 中
-    ht_seq = x[:, :, :, 1::2].detach().cpu()
+    # 1. 拦截输入，在 CPU 上重演动力学，提取全量时序状态 ht
+    ht_seq = extract_hidden_states_pytorch(u, delta, A, B, C, delta_bias, delta_softplus)
     hooked_states.append(ht_seq)
+    
+    # 2. 原样调用 CUDA 算子，保证模型主流程不受任何影响
+    return original_cuda_fwd(u, delta, A, B, C, D, z, delta_bias, delta_softplus)
 
-    # 3. 原样返回，不影响正常前向传播
-    return out, x, *rest
-
-# 实施劫持替换
 selective_scan_interface.selective_scan_cuda.fwd = patched_cuda_fwd
 
 # ==========================================
@@ -45,7 +88,7 @@ config = {
         'd_state': 16,
         'expand': 4,
         'd_conv': 4,
-        'bidirectional': True # 双向 Mamba
+        'bidirectional': True
     }
 }
 model = DepMamba(**config).cuda().eval()
@@ -56,9 +99,9 @@ model = DepMamba(**config).cuda().eval()
 batch_size = 1
 normal_T = 400
 stretch_factor = 5
-stretched_T = normal_T * stretch_factor # 2000 帧的长序列
+stretched_T = normal_T * stretch_factor # 2000 帧长序列
 
-# 构造数据：前 400 帧为有效高频信号，后 1600 帧完全是 Padding 或重复噪声
+# 构造数据：前 400 帧为有效信号，后 1600 帧完全是 0 (Padding 冗余)
 valid_signal = torch.randn(batch_size, normal_T, 136 + 128)
 redundant_signal = torch.zeros(batch_size, stretched_T - normal_T, 136 + 128)
 pathology_input = torch.cat([valid_signal, redundant_signal], dim=1).cuda()
@@ -66,45 +109,41 @@ mask = torch.ones(batch_size, stretched_T).cuda()
 
 print(f"[Probe] 开始向 DepMamba 注入长度为 {stretched_T} 的病理序列...")
 
-# ==========================================
-# 步骤 4：执行探针前向传播
-# ==========================================
 with torch.no_grad():
     _ = model(pathology_input, mask)
 
 print(f"[Probe] 成功截获底层状态！共捕获到 {len(hooked_states)} 次 SSM 算子调用。")
 
 # ==========================================
-# 步骤 5：计算动态饱和度 (Delta t)
+# 步骤 4：计算动态饱和度 (Delta t)
 # ==========================================
-# 因为模型使用了 Bi-Mamba，一次层的前向包含音频/视频的前向与反向扫描。
-# 我们取第一次截获的状态（例如：CoSSM 中的音频前向扫描状态）进行解剖
-target_state_seq = hooked_states[0] # 形状: [Batch, Dim, SeqLen, DState]
+# target_state_seq 形状现在一定是: [1, Dim, 2000, DState]
+target_state_seq = hooked_states[0] 
 
-# 提取 Batch 0，并排列为 [SeqLen, Dim * DState] 以计算整体范数
+# 取 Batch 0 -> [Dim, SeqLen, DState]
+# permute(1, 0, 2) -> [SeqLen, Dim, DState]
+# reshape(2000, -1) -> [2000, Dim * DState]
 ht = target_state_seq[0].permute(1, 0, 2).reshape(stretched_T, -1)
 
-# 计算 t 和 t-1 的状态差异
+# 计算 t 和 t-1 的差异
 ht_minus_1 = ht[:-1, :]
 ht_current = ht[1:, :]
 
-# 计算范数变化率 (加入 1e-8 防止除 0)
+# 计算范数变化率
 diff_norm = torch.norm(ht_current - ht_minus_1, p=2, dim=-1)
 base_norm = torch.norm(ht_minus_1, p=2, dim=-1)
 delta_t = diff_norm / (base_norm + 1e-8)
 delta_t = delta_t.numpy()
 
 # ==========================================
-# 步骤 6：生成诊断图谱
+# 步骤 5：生成诊断图谱
 # ==========================================
 plt.figure(figsize=(12, 5))
 plt.plot(range(1, stretched_T), delta_t, label=r'$\\delta_t = \\frac{||h_t - h_{t-1}||_2}{||h_{t-1}||_2}$', color='b', linewidth=1.5)
 
-# 标记正常输入区和冗余病理区
 plt.axvspan(0, normal_T, color='green', alpha=0.1, label='Normal Signal Zone')
 plt.axvspan(normal_T, stretched_T, color='red', alpha=0.1, label='Redundant Padding Zone')
 
-# 绘制极小阈值线 (例如 1e-4)
 collapse_threshold = 1e-4
 plt.axhline(y=collapse_threshold, color='r', linestyle='--', label=f'Collapse Threshold ({collapse_threshold})')
 
