@@ -1,126 +1,195 @@
-import torch
-import torch.nn as nn
+import argparse
+import csv
+from pathlib import Path
+
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
+import yaml
 
-# 导入模型
 from models.DepMamba import DepMamba
 
-def run_ultimate_erf_probe():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"正在使用设备: {device} 进行多点时序探针诊断...")
 
-    # 1. 加载模型配置
-    config = {
-        'audio_input_size': 25,
-        'video_input_size': 136,
-        'mm_input_size': 256,
-        'mm_output_sizes': [256],
-        'dropout': 0.1,
-        'd_ffn': 1024,
-        'num_layers': 1,
-        'activation': 'GELU',
-        'causal': False,
-        'mamba_config': {
-            'd_state': 12,
-            'expand': 4,
-            'd_conv': 4,
-            'bidirectional': True # 开启双向
-        }
-    }
+DEFAULT_CONFIG_PATH = Path("config/config.yaml")
+DEFAULT_DATA_ROOT = Path("/datasets/work/hb-nhmrc-dhcp/work/liu275/Depression/DVLOG_Feature")
+DEFAULT_CKPT = Path(
+    "/datasets/work/hb-nhmrc-dhcp/work/liu275/Depression/DepMamba/mambamodels/"
+    "dvlog_DepMamba_2/checkpoints/best_model.pt"
+)
 
-    model = DepMamba(**config).to(device)
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Real-data ERF probe for DepMamba on D-Vlog")
+    parser.add_argument("--data_root", type=Path, default=DEFAULT_DATA_ROOT, help="D-Vlog feature root")
+    parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CKPT, help="Path to pretrained weights")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH, help="Path to config YAML")
+    parser.add_argument(
+        "--case_index",
+        type=int,
+        default=19,
+        help="Global row index in labels.csv (recommended test rows: 19, 920, 14)",
+    )
+    parser.add_argument(
+        "--probe",
+        choices=["logit", "prepool_t0", "prepool_mid", "prepool_last"],
+        default="logit",
+        help="Probe target: final logit or pre-pooling hidden step",
+    )
+    parser.add_argument("--save_prefix", type=str, default="real_depmamba_erf", help="Output prefix")
+    return parser.parse_args()
+
+
+def load_model(model_cfg: dict, ckpt_path: Path, device: torch.device) -> DepMamba:
+    model = DepMamba(**model_cfg).to(device)
+
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        state_dict = checkpoint["state_dict"]
+    else:
+        state_dict = checkpoint
+
+    if any(k.startswith("module.") for k in state_dict.keys()):
+        state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+
+    model.load_state_dict(state_dict, strict=True)
     model.eval()
+    for p in model.parameters():
+        p.requires_grad = False
+    return model
 
-    # 2. 准备基准序列
-    seq_len = 1000
-    X = torch.randn(1, seq_len, 161, device=device) * 0.1
-    X.requires_grad_(True)
-    mask = torch.ones(1, seq_len, device=device)
 
-    # 3. 注册 Hook 拦截池化前特征
+def load_case_feature(data_root: Path, case_index: int):
+    labels_path = data_root / "labels.csv"
+    with labels_path.open("r", encoding="utf-8") as f:
+        rows = list(csv.reader(f))
+
+    if case_index < 0 or case_index >= len(rows):
+        raise IndexError(f"case_index={case_index} out of range [0, {len(rows) - 1}]")
+
+    row = rows[case_index]
+    sample_id, label_text, _, gender, fold = row[:5]
+
+    if fold != "test":
+        print(f"[WARN] case_index={case_index} belongs to fold={fold}, not test.")
+
+    video = np.load(data_root / sample_id / f"{sample_id}_visual.npy").astype(np.float32)
+    audio = np.load(data_root / sample_id / f"{sample_id}_acoustic.npy").astype(np.float32)
+
+    t = min(video.shape[0], audio.shape[0])
+    x = np.concatenate([video[:t], audio[:t]], axis=1)
+
+    meta = {
+        "sample_id": sample_id,
+        "label_text": label_text,
+        "label": int(label_text == "depression"),
+        "gender": gender,
+        "fold": fold,
+        "seq_len": t,
+        "video_dim": video.shape[1],
+        "audio_dim": audio.shape[1],
+    }
+    return x, meta
+
+
+def select_target(model: DepMamba, x: torch.Tensor, mask: torch.Tensor, probe: str):
+    if probe == "logit":
+        logits = model(x, mask)
+        target = logits[0, 0]
+        return target, {"kind": "logit", "target_t": None}
+
     hook_data = {}
-    def hook_fn(module, input, output):
-        hook_data['pre_pool_features'] = output
 
-    hook_handle = model.enssm_encoder.register_forward_hook(hook_fn)
+    def _hook(_, __, output):
+        hook_data["pre_pool"] = output
 
-    # 4. 执行前向传播
-    y_logits = model(X, mask)
-    pre_pool_feat = hook_data['pre_pool_features'] # shape: [1, 1000, Dim]
+    handle = model.enssm_encoder.register_forward_hook(_hook)
+    logits = model(x, mask)
+    _ = logits  # keep explicit forward in graph
+    pre_pool = hook_data["pre_pool"]  # shape [1, T, D]
+    t = pre_pool.shape[1]
 
-    # --- 辅助函数：计算并提取特定 Target 的梯度范数 ---
-    def get_erf_for_target(target_tensor):
-        model.zero_grad()
-        if X.grad is not None:
-            X.grad.zero_()
+    if probe == "prepool_t0":
+        idx = 0
+    elif probe == "prepool_mid":
+        idx = t // 2
+    else:
+        idx = t - 1
 
-        # retain_graph=True 允许我们对同一个计算图多次 backward
-        target_tensor.backward(retain_graph=True)
+    target = pre_pool[:, idx, :].sum()
+    handle.remove()
+    return target, {"kind": "prepool", "target_t": idx}
 
-        grad_wrt_X = X.grad.clone()
-        # 计算每个时间步的 Frobenius 范数
-        erf = torch.norm(grad_wrt_X.squeeze(0), p='fro', dim=1).cpu().numpy()
-        return erf
 
-    # 5. 执行多点探针诊断
-    print("正在计算全局池化系统的 ERF...")
-    I_sys = get_erf_for_target(y_logits.sum())
+def run_real_erf_probe(args: argparse.Namespace):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-    print("正在计算 t=0 (验证反向 Mamba 回溯) 的 ERF...")
-    I_t0 = get_erf_for_target(pre_pool_feat[:, 0, :].sum())
+    with args.config.open("r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    model_cfg = cfg["mmmamba"]
 
-    print("正在计算 t=500 (验证双向扩散) 的 ERF...")
-    I_t500 = get_erf_for_target(pre_pool_feat[:, 500, :].sum())
+    print(f"Loading model config from: {args.config}")
+    print(f"Loading weights from: {args.checkpoint}")
+    model = load_model(model_cfg, args.checkpoint, device)
 
-    print("正在计算 t=999 (验证正向 Mamba 记忆) 的 ERF...")
-    I_t999 = get_erf_for_target(pre_pool_feat[:, -1, :].sum())
+    print(f"Loading real D-Vlog case from labels.csv index={args.case_index}")
+    feature_np, meta = load_case_feature(args.data_root, args.case_index)
+    print(f"Case meta: {meta}")
 
-    hook_handle.remove()
+    x = torch.from_numpy(feature_np).unsqueeze(0).to(device)
+    x.requires_grad_(True)
+    mask = torch.ones(1, x.shape[1], device=device)
 
-    # 6. 可视化终极确诊报告 (2x2 画布)
-    fig, axs = plt.subplots(2, 2, figsize=(16, 10))
-    fig.suptitle("Ultimate ERF Probe: Unveiling Bidirectional Mamba Dynamics", fontsize=18, fontweight='bold')
+    target, target_meta = select_target(model, x, mask, args.probe)
 
-    # 图 1: 系统级 (带池化掩护)
-    axs[0, 0].plot(I_sys, color='blue', linewidth=2)
-    axs[0, 0].fill_between(range(seq_len), I_sys, alpha=0.2, color='blue')
-    axs[0, 0].set_title("1. System-Level ERF (With Global Pooling)", fontsize=12)
-    axs[0, 0].set_ylabel(r"$|| \partial y / \partial x_t ||_F$", fontsize=11)
-    axs[0, 0].grid(True, linestyle='--', alpha=0.6)
+    model.zero_grad(set_to_none=True)
+    target.backward()
 
-    # 图 2: 起点探测 t=0
-    axs[0, 1].plot(I_t0, color='purple', linewidth=2)
-    axs[0, 1].fill_between(range(seq_len), I_t0, alpha=0.2, color='purple')
-    axs[0, 1].axvline(x=0, color='black', linestyle=':', label='Probe Target t=0')
-    axs[0, 1].set_title("2. Probe at $t=0$ (Testing Backward Mamba)", fontsize=12)
-    axs[0, 1].set_ylabel(r"$|| \partial h_0 / \partial x_t ||_F$", fontsize=11)
-    axs[0, 1].legend()
-    axs[0, 1].grid(True, linestyle='--', alpha=0.6)
+    grad = x.grad[0].detach().cpu().numpy()  # [T, 161]
+    video_grad = grad[:, : meta["video_dim"]]
+    audio_grad = grad[:, meta["video_dim"] :]
 
-    # 图 3: 中点探测 t=500
-    axs[1, 0].plot(I_t500, color='green', linewidth=2)
-    axs[1, 0].fill_between(range(seq_len), I_t500, alpha=0.2, color='green')
-    axs[1, 0].axvline(x=500, color='black', linestyle=':', label='Probe Target t=500')
-    axs[1, 0].set_title("3. Probe at $t=500$ (Testing Bidirectional Spread)", fontsize=12)
-    axs[1, 0].set_xlabel("Input Time Step $t$", fontsize=11)
-    axs[1, 0].set_ylabel(r"$|| \partial h_{500} / \partial x_t ||_F$", fontsize=11)
-    axs[1, 0].legend()
-    axs[1, 0].grid(True, linestyle='--', alpha=0.6)
+    erf_video = np.linalg.norm(video_grad, axis=1)
+    erf_audio = np.linalg.norm(audio_grad, axis=1)
+    erf_joint = np.linalg.norm(grad, axis=1)
 
-    # 图 4: 终点探测 t=999
-    axs[1, 1].plot(I_t999, color='red', linewidth=2)
-    axs[1, 1].fill_between(range(seq_len), I_t999, alpha=0.2, color='red')
-    axs[1, 1].axvline(x=999, color='black', linestyle=':', label='Probe Target t=999')
-    axs[1, 1].set_title("4. Probe at $t=999$ (Testing Forward Mamba)", fontsize=12)
-    axs[1, 1].set_xlabel("Input Time Step $t$", fontsize=11)
-    axs[1, 1].set_ylabel(r"$|| \partial h_{999} / \partial x_t ||_F$", fontsize=11)
-    axs[1, 1].legend()
-    axs[1, 1].grid(True, linestyle='--', alpha=0.6)
+    out_prefix = f"{args.save_prefix}_idx{args.case_index}_{args.probe}"
+    np.savez(
+        f"{out_prefix}.npz",
+        erf_joint=erf_joint,
+        erf_video=erf_video,
+        erf_audio=erf_audio,
+        meta=meta,
+        target_meta=target_meta,
+    )
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.savefig("ultimate_mamba_erf.png", dpi=300)
-    print("确诊报告已生成：ultimate_mamba_erf.png")
+    t_axis = np.arange(meta["seq_len"])
+    plt.figure(figsize=(13, 6))
+    plt.plot(t_axis, erf_joint, label="Joint (V+A)", linewidth=2.2, color="teal")
+    plt.plot(t_axis, erf_video, label="Video", linewidth=1.4, alpha=0.9, color="royalblue")
+    plt.plot(t_axis, erf_audio, label="Audio", linewidth=1.4, alpha=0.9, color="darkorange")
+    plt.fill_between(t_axis, erf_joint, color="teal", alpha=0.15)
+
+    if target_meta["target_t"] is not None:
+        plt.axvline(target_meta["target_t"], linestyle=":", color="black", label=f"Probe t={target_meta['target_t']}")
+
+    plt.title(
+        "Real ERF of DepMamba on D-Vlog"
+        f"\ncase_index={args.case_index}, sample_id={meta['sample_id']}, label={meta['label_text']}, len={meta['seq_len']}",
+        fontsize=12,
+    )
+    plt.xlabel("Time Step t")
+    plt.ylabel(r"Gradient Norm $||\partial y / \partial x_t||_F$")
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.legend()
+    plt.tight_layout()
+    fig_path = f"{out_prefix}.png"
+    plt.savefig(fig_path, dpi=300)
+    print(f"Probe finished. Saved figure: {fig_path}")
+    print(f"Saved curve data: {out_prefix}.npz")
+
 
 if __name__ == "__main__":
-    run_ultimate_erf_probe()
+    run_real_erf_probe(parse_args())
