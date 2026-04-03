@@ -1,6 +1,7 @@
 import os
 
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import yaml
 
@@ -71,13 +72,26 @@ def main() -> None:
 
     model.eval()
 
-    # ================= 2. 准备探针数据 =================
-    dim = mamba_cfg["audio_input_size"] + mamba_cfg["video_input_size"]
-    healthy_tensor = torch.randn(10000, dim)
-    depressed_tensor = torch.randn(500, dim) + 2.0
+    # ================= 2. 准备真实探针数据 =================
+    # 请将下面的路径替换为您实际的 .npy 文件路径！
+    # 1. 加载抑郁症样本 (提取病理微表情)
+    dep_v = np.load("/您的路径/dep_v.npy")
+    dep_a = np.load("/您的路径/dep_a.npy")
+    dep_np = np.concatenate((dep_v, dep_a), axis=-1)
+    depressed_tensor = torch.from_numpy(dep_np).float()
+
+    # 2. 加载健康样本 (作为漫长的背景)
+    nor_v = np.load("/您的路径/nor_v.npy")
+    nor_a = np.load("/您的路径/nor_a.npy")
+    nor_np = np.concatenate((nor_v, nor_a), axis=-1)
+
+    # 真实健康视频可能不够长，循环复制到足够长度以模拟长背景。
+    healthy_tensor = torch.from_numpy(nor_np).float()
+    repeat_times = 8000 // healthy_tensor.shape[0] + 1
+    healthy_tensor = healthy_tensor.repeat(repeat_times, 1)
 
     dep_length = 30
-    L_list = [50, 100, 200, 500, 1000, 2000, 5000, 8000]
+    L_list = [30, 40, 50, 75, 100, 150, 200, 500, 1000, 2000, 5000]
     probabilities = []
 
     # ================= 3. 运行探针实验 =================
