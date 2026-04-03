@@ -1,10 +1,12 @@
 import argparse
 import csv
+import math
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn as nn
 import yaml
 
 from models.DepMamba import DepMamba
@@ -35,8 +37,34 @@ def parse_args() -> argparse.Namespace:
         default="logit",
         help="Probe target: final logit or pre-pooling hidden step",
     )
+    parser.add_argument(
+        "--deci_factor",
+        type=float,
+        default=1.0,
+        help="DeciMamba hack factor. 1.0 keeps baseline; >1.0 shrinks Delta via dt_proj bias shift.",
+    )
     parser.add_argument("--save_prefix", type=str, default="real_depmamba_erf", help="Output prefix")
     return parser.parse_args()
+
+
+def inject_decimamba_hack(model: DepMamba, deci_factor: float = 1.0) -> int:
+    """Shift dt_proj bias by -log(K) to approximate Delta -> Delta / K."""
+    if deci_factor <= 1.0:
+        print("🔬 [Deci-Probe] deci_factor <= 1.0; skipping hack (baseline).")
+        return 0
+
+    shift_val = math.log(deci_factor)
+    modified_count = 0
+
+    for name, module in model.named_modules():
+        if "dt_proj" in name and isinstance(module, nn.Linear) and module.bias is not None:
+            with torch.no_grad():
+                module.bias.sub_(shift_val)
+            modified_count += 1
+
+    print(f"🔬 [Deci-Probe] Modified {modified_count} dt_proj layers.")
+    print(f"🔬 [Deci-Probe] deci_factor = {deci_factor}, bias shift = -{shift_val:.4f}")
+    return modified_count
 
 
 def load_model(model_cfg: dict, ckpt_path: Path, device: torch.device) -> DepMamba:
@@ -133,6 +161,7 @@ def run_real_erf_probe(args: argparse.Namespace):
     print(f"Loading model config from: {args.config}")
     print(f"Loading weights from: {args.checkpoint}")
     model = load_model(model_cfg, args.checkpoint, device)
+    inject_decimamba_hack(model, args.deci_factor)
 
     print(f"Loading real D-Vlog case from labels.csv index={args.case_index}")
     feature_np, meta = load_case_feature(args.data_root, args.case_index)
@@ -155,7 +184,7 @@ def run_real_erf_probe(args: argparse.Namespace):
     erf_audio = np.linalg.norm(audio_grad, axis=1)
     erf_joint = np.linalg.norm(grad, axis=1)
 
-    out_prefix = f"{args.save_prefix}_idx{args.case_index}_{args.probe}"
+    out_prefix = f"{args.save_prefix}_idx{args.case_index}_{args.probe}_deci_{args.deci_factor:g}"
     np.savez(
         f"{out_prefix}.npz",
         erf_joint=erf_joint,
