@@ -1,10 +1,12 @@
 import argparse
 import csv
+import math
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn as nn
 import yaml
 
 from models.DepMamba import DepMamba
@@ -16,6 +18,52 @@ DEFAULT_CKPT = Path(
     "/datasets/work/hb-nhmrc-dhcp/work/liu275/Depression/DepMamba/mambamodels/"
     "dvlog_DepMamba_2/checkpoints/best_model.pt"
 )
+
+
+def inject_longmamba_probe(model, threshold_A_percentile=0.5, threshold_dt=-2.0):
+    """
+    模拟 LongMamba 的两阶段策略：
+    1. 寻找 Global Channels
+    2. 在 Global Channels 上进行 Token Filtering (当 dt 过小时冻结状态)
+
+    threshold_A_percentile: 将 A 矩阵绝对值均值最小的前 X% 通道定义为 Global Channels (0.5表示50%)
+    threshold_dt: 过滤阈值 g (在 pre-softplus 的 z 空间中，-2.0 约等于 dt=0.12)
+    """
+    modified_modules = 0
+
+    for name, module in model.named_modules():
+        # 定位 Mamba 核心层 (通常包含 A_log 和 dt_proj)
+        if hasattr(module, "A_log") and hasattr(module, "dt_proj"):
+            # Step 1: 识别 Global Channels (LongMamba 论文逻辑)
+            # A_log shape 通常是 [d_inner, d_state]
+            A = -torch.exp(module.A_log.float())
+            A_mean = A.mean(dim=-1)  # [d_inner]
+
+            # 找到 A_mean 最大的（即衰减最慢的，最接近 0 的）通道作为 Global Channels
+            k = int(A_mean.shape[0] * threshold_A_percentile)
+            k = max(1, min(k, A_mean.shape[0]))
+            # 获取阈值
+            A_threshold = torch.kthvalue(A_mean, A_mean.shape[0] - k + 1)[0]
+            global_channel_mask = A_mean >= A_threshold  # [d_inner]
+
+            # Step 2: 注册 Forward Hook 实施 Token Filtering
+            def longmamba_hook(m, inp, out, mask=global_channel_mask):
+                # out 是 dt_proj 的输出 z，通常 shape 为 [Batch, SeqLen, d_inner]
+                # 当 z < threshold_dt 时，我们认为该 token 不重要
+                filter_mask = out < threshold_dt
+
+                # 仅对 Global Channels 且 z 小于阈值的位置进行干预
+                # 将 z 设为一个极小的负数 (如 -100)，这样 softplus(-100) 约等于 0
+                # 从而使得 A_bar 约等于 1，B_bar 约等于 0，实现 H_t = H_{t-1}
+                combined_mask = filter_mask & mask.unsqueeze(0).unsqueeze(0).to(out.device)
+
+                return out.masked_fill(combined_mask, -100.0)
+
+            module.dt_proj.register_forward_hook(longmamba_hook)
+            modified_modules += 1
+
+    print(f"🔬 [LongMamba-Probe] 已在 {modified_modules} 个 Mamba 模块上实施探针!")
+    print(f"🔬 [LongMamba-Probe] 设定 {threshold_A_percentile*100}% 的通道为 Global Channels, 过滤阈值 z < {threshold_dt}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,6 +82,23 @@ def parse_args() -> argparse.Namespace:
         choices=["logit", "prepool_t0", "prepool_mid", "prepool_last"],
         default="logit",
         help="Probe target: final logit or pre-pooling hidden step",
+    )
+    parser.add_argument(
+        "--threshold_A_percentile",
+        type=float,
+        default=0.5,
+        help="Global channel percentile for LongMamba probe (0.5 means 50%%)",
+    )
+    parser.add_argument(
+        "--threshold_dt",
+        type=float,
+        default=-2.0,
+        help="Token filtering threshold on pre-softplus z for LongMamba probe",
+    )
+    parser.add_argument(
+        "--disable_longmamba_probe",
+        action="store_true",
+        help="Disable LongMamba hook injection (for ablation/baseline).",
     )
     parser.add_argument("--save_prefix", type=str, default="real_depmamba_erf", help="Output prefix")
     return parser.parse_args()
@@ -133,6 +198,14 @@ def run_real_erf_probe(args: argparse.Namespace):
     print(f"Loading model config from: {args.config}")
     print(f"Loading weights from: {args.checkpoint}")
     model = load_model(model_cfg, args.checkpoint, device)
+    if not args.disable_longmamba_probe:
+        inject_longmamba_probe(
+            model,
+            threshold_A_percentile=args.threshold_A_percentile,
+            threshold_dt=args.threshold_dt,
+        )
+    else:
+        print("🔬 [LongMamba-Probe] disabled by --disable_longmamba_probe")
 
     print(f"Loading real D-Vlog case from labels.csv index={args.case_index}")
     feature_np, meta = load_case_feature(args.data_root, args.case_index)
