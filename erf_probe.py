@@ -41,6 +41,7 @@ def inject_longmamba_probe(model, threshold_A_percentile=0.5, threshold_dt=-2.0)
 
             # 找到 A_mean 最大的（即衰减最慢的，最接近 0 的）通道作为 Global Channels
             k = int(A_mean.shape[0] * threshold_A_percentile)
+            k = max(1, min(k, A_mean.shape[0]))
             # 获取阈值
             A_threshold = torch.kthvalue(A_mean, A_mean.shape[0] - k + 1)[0]
             global_channel_mask = A_mean >= A_threshold  # [d_inner]
@@ -81,6 +82,23 @@ def parse_args() -> argparse.Namespace:
         choices=["logit", "prepool_t0", "prepool_mid", "prepool_last"],
         default="logit",
         help="Probe target: final logit or pre-pooling hidden step",
+    )
+    parser.add_argument(
+        "--threshold_A_percentile",
+        type=float,
+        default=0.5,
+        help="Global channel percentile for LongMamba probe (0.5 means 50%%)",
+    )
+    parser.add_argument(
+        "--threshold_dt",
+        type=float,
+        default=-2.0,
+        help="Token filtering threshold on pre-softplus z for LongMamba probe",
+    )
+    parser.add_argument(
+        "--disable_longmamba_probe",
+        action="store_true",
+        help="Disable LongMamba hook injection (for ablation/baseline).",
     )
     parser.add_argument("--save_prefix", type=str, default="real_depmamba_erf", help="Output prefix")
     return parser.parse_args()
@@ -180,6 +198,14 @@ def run_real_erf_probe(args: argparse.Namespace):
     print(f"Loading model config from: {args.config}")
     print(f"Loading weights from: {args.checkpoint}")
     model = load_model(model_cfg, args.checkpoint, device)
+    if not args.disable_longmamba_probe:
+        inject_longmamba_probe(
+            model,
+            threshold_A_percentile=args.threshold_A_percentile,
+            threshold_dt=args.threshold_dt,
+        )
+    else:
+        print("🔬 [LongMamba-Probe] disabled by --disable_longmamba_probe")
 
     print(f"Loading real D-Vlog case from labels.csv index={args.case_index}")
     feature_np, meta = load_case_feature(args.data_root, args.case_index)
