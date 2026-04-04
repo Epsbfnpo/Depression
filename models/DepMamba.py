@@ -199,3 +199,34 @@ class DepMamba(BaseNet):
 
     def classifier(self, x):
         return self.output(x)
+
+    def forward(self, x, padding_mask=None, a_inference_params=None, v_inference_params=None):
+        xa = x[:, :, 136:]
+        xv = x[:, :, :136]
+        
+        xa = self.conv_audio(xa.permute(0,2,1)).permute(0,2,1)
+        xv = self.conv_video(xv.permute(0,2,1)).permute(0,2,1)
+        
+        xa_out, xv_out = self.cossm_encoder(xa, xv, a_inference_params, v_inference_params)
+        
+        x_cat = torch.cat([xa_out, xv_out], dim=-1)
+        x_fused = self.enssm_encoder(x_cat)
+        
+        if padding_mask is not None:
+            mask_float = padding_mask.unsqueeze(-1).float()
+            x_pooled = x_fused * mask_float
+            x_pooled = x_pooled.sum(dim=1) / mask_float.sum(dim=1, keepdim=False)
+            if self.training:
+                za = (xa_out * mask_float).sum(dim=1) / mask_float.sum(dim=1, keepdim=False)
+                zv = (xv_out * mask_float).sum(dim=1) / mask_float.sum(dim=1, keepdim=False)
+        else:
+            x_pooled = self.pool(x_fused.permute(0,2,1)).squeeze(-1)
+            if self.training:
+                za = xa_out.mean(dim=1)
+                zv = xv_out.mean(dim=1)
+                
+        out = self.classifier(x_pooled)
+        
+        if self.training:
+            return out, za, zv
+        return out
