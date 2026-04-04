@@ -173,8 +173,8 @@ class DepMamba(BaseNet):
     def __init__(self, audio_input_size=161, video_input_size=161, mm_input_size=128, mm_output_sizes=[256,64], d_ffn=1024, num_layers=8, dropout=0.1, activation='Swish', causal=False, mamba_config=None):
         super().__init__()
         self.cossm_encoder = CoSSM(num_layers, mm_input_size, mm_output_sizes, d_ffn, activation=activation, dropout=dropout, causal=causal, mamba_config=mamba_config)
-        self.conv_audio = nn.Conv1d(audio_input_size, mm_input_size, 1, padding=0, dilation=1, bias=False)
-        self.conv_video = nn.Conv1d(video_input_size, mm_input_size, 1, padding=0, dilation=1, bias=False)
+        self.conv_audio = nn.Conv1d(audio_input_size, mm_input_size, kernel_size=3, padding=1, dilation=1, bias=False)
+        self.conv_video = nn.Conv1d(video_input_size, mm_input_size, kernel_size=3, padding=1, dilation=1, bias=False)
         self.enssm_encoder = EnSSM(num_layers, mm_output_sizes[-1]*2, [mm_output_sizes[-1]*2], d_ffn, activation=activation, dropout=dropout, causal=causal, mamba_config=mamba_config)
         self.pool = nn.AdaptiveMaxPool1d(1)
         self.output = nn.Linear(mm_output_sizes[-1]*2, 1)
