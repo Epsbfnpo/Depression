@@ -65,6 +65,8 @@ def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, to
     net.train()
     sample_count = 0
     running_loss = 0.
+    running_cls_loss = 0.
+    running_ortho_loss = 0.
     correct_count = 0
     with tqdm(train_loader, desc=f"Training epoch {current_epoch}/{total_epochs}", leave=False, unit="batch", disable=tqdm_able) as pbar:
         for x, y, mask in pbar:
@@ -74,31 +76,17 @@ def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, to
             ortho_loss = torch.mean(torch.sum(F.normalize(za, dim=-1) * F.normalize(zv, dim=-1), dim=-1)**2)
             alpha = 0.1
             loss = cls_loss + alpha * ortho_loss
-            
-            # ========== [DEBUG 探针 2: 验证正交 Loss 是否激活] ==========
-            # 仅在 Epoch 0 的第一个 Batch 打印，防止刷屏
-            if current_epoch == 0 and sample_count == 0:
-                print(f"\n" + "-"*50)
-                print(f"📊 [前向传播审查]: 第一批次特征提取状态")
-                print(f" -> Za 维度: {za.shape} | Zv 维度: {zv.shape}")
-                print(f" -> 主分类 Loss (CLS) : {cls_loss.item():.6f}")
-                print(f" -> 正交惩罚 Loss (Ortho) : {ortho_loss.item():.6f} (权重 alpha={alpha})")
-                print(f" -> 联合总 Loss : {loss.item():.6f}")
-                if ortho_loss.item() > 0:
-                    print("✅ 确诊: 正交 Loss 已成功计算，即将执行联合梯度回传！")
-                else:
-                    print("❌ 致命错误: 正交 Loss 为 0，正交切除术失效！")
-                print("-" * 50 + "\n")
-            # ========================================================
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
             sample_count += x.shape[0]
             running_loss += loss.item() * x.shape[0]
+            running_cls_loss += cls_loss.item() * x.shape[0]
+            running_ortho_loss += ortho_loss.item() * x.shape[0]
             pred = (y_pred > 0.).int()
             correct_count += (pred == y).sum().item()
-            pbar.set_postfix({"loss": running_loss / sample_count, "acc": correct_count / sample_count,})
-    return {"loss": running_loss / sample_count, "acc": correct_count / sample_count,}
+            pbar.set_postfix({"TotL": running_loss / sample_count, "ClsL": running_cls_loss / sample_count, "OrtL": running_ortho_loss / sample_count, "Acc": correct_count / sample_count,})
+    return {"loss": running_loss / sample_count, "cls_loss": running_cls_loss / sample_count, "ortho_loss": running_ortho_loss / sample_count, "acc": correct_count / sample_count,}
 
 def val(net, val_loader, loss_fn, device, tqdm_able):
     net.eval()
@@ -213,12 +201,15 @@ def main():
             for epoch in range(args.epochs):
                 train_results = train_epoch(net, train_loader, loss_fn, optimizer, args.device[0], epoch, args.epochs, args.tqdm_able)
                 val_results = val(net, val_loader, loss_fn, args.device[0],args.tqdm_able)
+                print(f"Epoch [{epoch+1:03d}/{args.epochs:03d}] "
+                      f"Train | TotL: {train_results['loss']:.4f}, ClsL: {train_results['cls_loss']:.4f}, OrtL: {train_results['ortho_loss']:.4f}, Acc: {train_results['acc']:.4f} "
+                      f"|| Val | Loss: {val_results['loss']:.4f}, Acc: {val_results['acc']:.4f}, P: {val_results['precision']:.4f}, R: {val_results['recall']:.4f}, F1: {val_results['f1']:.4f}")
                 val_acc = (val_results["acc"] + val_results["precision"]+ val_results["recall"]+ val_results["f1"])/4.0
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
                     torch.save(net.state_dict(),f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt")
                 if args.if_wandb:
-                    wandb.log({"loss/train": train_results["loss"], "acc/train": train_results["acc"], "loss/val": val_results["loss"], "acc/val": val_results["acc"], "precision/val": val_results["precision"], "recall/val": val_results["recall"], "f1/val": val_results["f1"]})
+                    wandb.log({"loss/train_total": train_results["loss"], "loss/train_cls": train_results["cls_loss"], "loss/train_ortho": train_results["ortho_loss"], "acc/train": train_results["acc"], "loss/val": val_results["loss"], "acc/val": val_results["acc"], "precision/val": val_results["precision"], "recall/val": val_results["recall"], "f1/val": val_results["f1"]})
                     
         with torch.no_grad():
             net.load_state_dict(torch.load(f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt", map_location=args.device[0]))
