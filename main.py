@@ -44,6 +44,9 @@ def parse_args():
     parser.add_argument("-e", "--epochs", type=int)
     parser.add_argument("-bs", "--batch_size", type=int)
     parser.add_argument("-lr", "--learning_rate", type=float)
+    parser.add_argument("--weight_decay", type=float)
+    parser.add_argument("--ortho_alpha", type=float)
+    parser.add_argument("--early_stopping_patience", type=int)
     parser.add_argument("-ds", "--dataset", type=str)
     parser.add_argument("-g", "--gpu", type=str, default="0", help="GPU id(s), e.g. '0' or '0,1' or 'cuda:0,1' or 'cpu'")
     parser.add_argument("-wdb", "--if_wandb", type=bool, default=False)
@@ -61,7 +64,7 @@ def _parse_gpu_arg(gpu_arg: str):
     ids = [int(x) for x in s.split(",") if x != ""]
     return ids
 
-def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, total_epochs, tqdm_able):
+def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, total_epochs, tqdm_able, ortho_alpha):
     net.train()
     sample_count = 0
     running_loss = 0.
@@ -74,8 +77,7 @@ def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, to
             y_pred, za, zv = net(x, mask)
             cls_loss = loss_fn(y_pred, y.to(torch.float32))
             ortho_loss = torch.mean(torch.sum(F.normalize(za, dim=-1) * F.normalize(zv, dim=-1), dim=-1)**2)
-            alpha = 0.1
-            loss = cls_loss + alpha * ortho_loss
+            loss = cls_loss + ortho_alpha * ortho_loss
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
@@ -193,13 +195,28 @@ def main():
             test_loader = get_lmvd_dataloader(args.data_dir, "test", args.batch_size, args.test_gender)
             
         loss_fn = torch.nn.BCEWithLogitsLoss()
-        optimizer = torch.optim.Adam(net.parameters(), lr=args.learning_rate)
+        optimizer = torch.optim.Adam(
+            net.parameters(),
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+        )
         best_val_acc = -1.0
         best_test_acc = -1.0
+        no_improve_epochs = 0
         
         if args.train:
             for epoch in range(args.epochs):
-                train_results = train_epoch(net, train_loader, loss_fn, optimizer, args.device[0], epoch, args.epochs, args.tqdm_able)
+                train_results = train_epoch(
+                    net,
+                    train_loader,
+                    loss_fn,
+                    optimizer,
+                    args.device[0],
+                    epoch,
+                    args.epochs,
+                    args.tqdm_able,
+                    args.ortho_alpha,
+                )
                 val_results = val(net, val_loader, loss_fn, args.device[0],args.tqdm_able)
                 print(f"Epoch [{epoch+1:03d}/{args.epochs:03d}] "
                       f"Train | TotL: {train_results['loss']:.4f}, ClsL: {train_results['cls_loss']:.4f}, OrtL: {train_results['ortho_loss']:.4f}, Acc: {train_results['acc']:.4f} "
@@ -207,7 +224,17 @@ def main():
                 val_acc = (val_results["acc"] + val_results["precision"]+ val_results["recall"]+ val_results["f1"])/4.0
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
+                    no_improve_epochs = 0
                     torch.save(net.state_dict(),f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt")
+                else:
+                    no_improve_epochs += 1
+
+                if no_improve_epochs >= args.early_stopping_patience:
+                    print(
+                        f"[EarlyStopping] Validation score has not improved for "
+                        f"{args.early_stopping_patience} epochs. Stopping at epoch {epoch + 1}."
+                    )
+                    break
                 if args.if_wandb:
                     wandb.log({"loss/train_total": train_results["loss"], "loss/train_cls": train_results["cls_loss"], "loss/train_ortho": train_results["ortho_loss"], "acc/train": train_results["acc"], "loss/val": val_results["loss"], "acc/val": val_results["acc"], "precision/val": val_results["precision"], "recall/val": val_results["recall"], "f1/val": val_results["f1"]})
                     
