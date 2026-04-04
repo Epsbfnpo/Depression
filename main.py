@@ -5,6 +5,7 @@ import numpy as np
 import yaml
 import wandb
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 from models import DepMamba
 from datasets import get_dvlog_dataloader, get_lmvd_dataloader
@@ -64,21 +65,28 @@ def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, to
     net.train()
     sample_count = 0
     running_loss = 0.
+    running_cls_loss = 0.
+    running_ortho_loss = 0.
     correct_count = 0
     with tqdm(train_loader, desc=f"Training epoch {current_epoch}/{total_epochs}", leave=False, unit="batch", disable=tqdm_able) as pbar:
         for x, y, mask in pbar:
             x, y, mask = x.to(device), y.to(device).unsqueeze(1), mask.to(device)
-            y_pred = net(x, mask)
-            loss = loss_fn(y_pred, y.to(torch.float32))
+            y_pred, za, zv = net(x, mask)
+            cls_loss = loss_fn(y_pred, y.to(torch.float32))
+            ortho_loss = torch.mean(torch.sum(F.normalize(za, dim=-1) * F.normalize(zv, dim=-1), dim=-1)**2)
+            alpha = 0.1
+            loss = cls_loss + alpha * ortho_loss
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
             sample_count += x.shape[0]
             running_loss += loss.item() * x.shape[0]
+            running_cls_loss += cls_loss.item() * x.shape[0]
+            running_ortho_loss += ortho_loss.item() * x.shape[0]
             pred = (y_pred > 0.).int()
             correct_count += (pred == y).sum().item()
-            pbar.set_postfix({"loss": running_loss / sample_count, "acc": correct_count / sample_count,})
-    return {"loss": running_loss / sample_count, "acc": correct_count / sample_count,}
+            pbar.set_postfix({"TotL": running_loss / sample_count, "ClsL": running_cls_loss / sample_count, "OrtL": running_ortho_loss / sample_count, "Acc": correct_count / sample_count,})
+    return {"loss": running_loss / sample_count, "cls_loss": running_cls_loss / sample_count, "ortho_loss": running_ortho_loss / sample_count, "acc": correct_count / sample_count,}
 
 def val(net, val_loader, loss_fn, device, tqdm_able):
     net.eval()
@@ -153,6 +161,25 @@ def main():
             raise NotImplementedError(f"The {args.model} method has not been implemented by this repo")
         net = net.to(args.device[0])
         
+        # ========== [DEBUG 探针 1: Mamba 参数解耦验证] ==========
+        if i_iter == 0: # 仅在第一次大循环时打印
+            print("\n" + "="*50)
+            print("🔬 [架构审查]: 验证动力学矩阵 A 的解耦状态")
+            param_names = [name for name, _ in net.named_parameters()]
+            has_a_A = any("a_A_log" in name for name in param_names)
+            has_v_A = any("v_A_log" in name for name in param_names)
+            has_shared_A = any("A_log" in name and "a_A_log" not in name and "v_A_log" not in name for name in param_names)
+            
+            if has_a_A and has_v_A:
+                print("✅ 确诊: a_A_log 和 v_A_log 已成功独立注册至计算图！")
+            else:
+                print("❌ 警告: 未检测到独立解耦的 A 参数，手术失败！")
+                
+            if has_shared_A:
+                print("⚠️ 警告: 仍然检测到残留的共享 A_log 参数，请检查是否删干净了！")
+            print("="*50 + "\n")
+        # ========================================================
+        
         if len(args.device) > 1:
             net = torch.nn.DataParallel(net, device_ids=args.device)
             
@@ -174,12 +201,15 @@ def main():
             for epoch in range(args.epochs):
                 train_results = train_epoch(net, train_loader, loss_fn, optimizer, args.device[0], epoch, args.epochs, args.tqdm_able)
                 val_results = val(net, val_loader, loss_fn, args.device[0],args.tqdm_able)
+                print(f"Epoch [{epoch+1:03d}/{args.epochs:03d}] "
+                      f"Train | TotL: {train_results['loss']:.4f}, ClsL: {train_results['cls_loss']:.4f}, OrtL: {train_results['ortho_loss']:.4f}, Acc: {train_results['acc']:.4f} "
+                      f"|| Val | Loss: {val_results['loss']:.4f}, Acc: {val_results['acc']:.4f}, P: {val_results['precision']:.4f}, R: {val_results['recall']:.4f}, F1: {val_results['f1']:.4f}")
                 val_acc = (val_results["acc"] + val_results["precision"]+ val_results["recall"]+ val_results["f1"])/4.0
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
                     torch.save(net.state_dict(),f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt")
                 if args.if_wandb:
-                    wandb.log({"loss/train": train_results["loss"], "acc/train": train_results["acc"], "loss/val": val_results["loss"], "acc/val": val_results["acc"], "precision/val": val_results["precision"], "recall/val": val_results["recall"], "f1/val": val_results["f1"]})
+                    wandb.log({"loss/train_total": train_results["loss"], "loss/train_cls": train_results["cls_loss"], "loss/train_ortho": train_results["ortho_loss"], "acc/train": train_results["acc"], "loss/val": val_results["loss"], "acc/val": val_results["acc"], "precision/val": val_results["precision"], "recall/val": val_results["recall"], "f1/val": val_results["f1"]})
                     
         with torch.no_grad():
             net.load_state_dict(torch.load(f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt", map_location=args.device[0]))
