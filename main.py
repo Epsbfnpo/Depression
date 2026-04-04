@@ -5,6 +5,7 @@ import numpy as np
 import yaml
 import wandb
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 from models import DepMamba
 from datasets import get_dvlog_dataloader, get_lmvd_dataloader
@@ -68,8 +69,11 @@ def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, to
     with tqdm(train_loader, desc=f"Training epoch {current_epoch}/{total_epochs}", leave=False, unit="batch", disable=tqdm_able) as pbar:
         for x, y, mask in pbar:
             x, y, mask = x.to(device), y.to(device).unsqueeze(1), mask.to(device)
-            y_pred = net(x, mask)
-            loss = loss_fn(y_pred, y.to(torch.float32))
+            y_pred, za, zv = net(x, mask)
+            cls_loss = loss_fn(y_pred, y.to(torch.float32))
+            ortho_loss = torch.mean(torch.sum(F.normalize(za, dim=-1) * F.normalize(zv, dim=-1), dim=-1)**2)
+            alpha = 0.1
+            loss = cls_loss + alpha * ortho_loss
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()

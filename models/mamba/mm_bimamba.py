@@ -72,8 +72,10 @@ class Mamba(nn.Module):
         self.v_dt_proj.bias._no_reinit = True
         A = repeat(torch.arange(1, self.d_state + 1, dtype=torch.float32, device=device), "n -> d n", d=self.d_inner,).contiguous()
         A_log = torch.log(A)
-        self.A_log = nn.Parameter(A_log)
-        self.A_log._no_weight_decay = True
+        self.a_A_log = nn.Parameter(A_log.clone())
+        self.a_A_log._no_weight_decay = True
+        self.v_A_log = nn.Parameter(A_log.clone())
+        self.v_A_log._no_weight_decay = True
         self.a_D = nn.Parameter(torch.ones(self.d_inner, device=device))
         self.a_D._no_weight_decay = True
         self.v_D = nn.Parameter(torch.ones(self.d_inner, device=device))
@@ -86,8 +88,10 @@ class Mamba(nn.Module):
         elif bimamba_type == "v2":
             A_b = repeat(torch.arange(1, self.d_state + 1, dtype=torch.float32, device=device), "n -> d n", d=self.d_inner,).contiguous()
             A_b_log = torch.log(A_b)
-            self.A_b_log = nn.Parameter(A_b_log)
-            self.A_b_log._no_weight_decay = True
+            self.a_A_b_log = nn.Parameter(A_b_log.clone())
+            self.a_A_b_log._no_weight_decay = True
+            self.v_A_b_log = nn.Parameter(A_b_log.clone())
+            self.v_A_b_log._no_weight_decay = True
             self.a_conv1d_b = nn.Conv1d(in_channels=self.d_inner, out_channels=self.d_inner, bias=conv_bias, kernel_size=d_conv, groups=self.d_inner, padding=d_conv - 1, **factory_kwargs,)
             self.v_conv1d_b = nn.Conv1d(in_channels=self.d_inner, out_channels=self.d_inner, bias=conv_bias, kernel_size=d_conv, groups=self.d_inner, padding=d_conv - 1, **factory_kwargs,)
             self.a_x_proj_b = nn.Linear(self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs)
@@ -118,18 +122,20 @@ class Mamba(nn.Module):
         v_xz = rearrange(self.v_in_proj.weight @ rearrange(v_hidden_states, "b l d -> d (b l)"), "d (b l) -> b d l", l=seqlen,)
         if self.v_in_proj.bias is not None:
             v_xz = v_xz + rearrange(self.v_in_proj.bias.to(dtype=v_xz.dtype), "d -> d 1")
-        A = -torch.exp(self.A_log.float())
+        a_A = -torch.exp(self.a_A_log.float())
+        v_A = -torch.exp(self.v_A_log.float())
         if self.use_fast_path and a_inference_params is None and v_inference_params is None:
             if self.bimamba_type == "v1":
                 A_b = -torch.exp(self.A_b_log.float())
-                a_out = bimamba_inner_fn(a_xz, self.a_conv1d.weight, self.a_conv1d.bias, self.a_x_proj.weight, self.a_dt_proj.weight, self.a_out_proj.weight, self.a_out_proj.bias, A, A_b, None, None, self.a_D.float(), delta_bias=self.a_dt_proj.bias.float(), delta_softplus=True,)
-                v_out = bimamba_inner_fn(v_xz, self.v_conv1d.weight, self.v_conv1d.bias, self.v_x_proj.weight, self.v_dt_proj.weight, self.v_out_proj.weight, self.v_out_proj.bias, A, A_b, None, None, self.v_D.float(), delta_bias=self.v_dt_proj.bias.float(), delta_softplus=True,)
+                a_out = bimamba_inner_fn(a_xz, self.a_conv1d.weight, self.a_conv1d.bias, self.a_x_proj.weight, self.a_dt_proj.weight, self.a_out_proj.weight, self.a_out_proj.bias, a_A, A_b, None, None, self.a_D.float(), delta_bias=self.a_dt_proj.bias.float(), delta_softplus=True,)
+                v_out = bimamba_inner_fn(v_xz, self.v_conv1d.weight, self.v_conv1d.bias, self.v_x_proj.weight, self.v_dt_proj.weight, self.v_out_proj.weight, self.v_out_proj.bias, v_A, A_b, None, None, self.v_D.float(), delta_bias=self.v_dt_proj.bias.float(), delta_softplus=True,)
             elif self.bimamba_type == "v2":
-                A_b = -torch.exp(self.A_b_log.float())
-                a_out = mamba_inner_fn_no_out_proj(a_xz, self.a_conv1d.weight, self.a_conv1d.bias, self.a_x_proj.weight, self.a_dt_proj.weight, A, None, None, self.a_D.float(), delta_bias=self.a_dt_proj.bias.float(), delta_softplus=True,)
-                a_out_b = mamba_inner_fn_no_out_proj(a_xz.flip([-1]), self.a_conv1d_b.weight, self.a_conv1d_b.bias, self.a_x_proj_b.weight, self.a_dt_proj_b.weight, A_b, None, None, self.a_D_b.float(), delta_bias=self.a_dt_proj_b.bias.float(), delta_softplus=True,)
-                v_out = mamba_inner_fn_no_out_proj(v_xz, self.v_conv1d.weight, self.v_conv1d.bias, self.v_x_proj.weight, self.v_dt_proj.weight, A, None, None, self.v_D.float(), delta_bias=self.v_dt_proj.bias.float(), delta_softplus=True,)
-                v_out_b = mamba_inner_fn_no_out_proj(v_xz.flip([-1]), self.v_conv1d_b.weight, self.v_conv1d_b.bias, self.v_x_proj_b.weight, self.v_dt_proj_b.weight, A_b, None, None, self.v_D_b.float(), delta_bias=self.v_dt_proj_b.bias.float(), delta_softplus=True,)
+                a_A_b = -torch.exp(self.a_A_b_log.float())
+                v_A_b = -torch.exp(self.v_A_b_log.float())
+                a_out = mamba_inner_fn_no_out_proj(a_xz, self.a_conv1d.weight, self.a_conv1d.bias, self.a_x_proj.weight, self.a_dt_proj.weight, a_A, None, None, self.a_D.float(), delta_bias=self.a_dt_proj.bias.float(), delta_softplus=True,)
+                a_out_b = mamba_inner_fn_no_out_proj(a_xz.flip([-1]), self.a_conv1d_b.weight, self.a_conv1d_b.bias, self.a_x_proj_b.weight, self.a_dt_proj_b.weight, a_A_b, None, None, self.a_D_b.float(), delta_bias=self.a_dt_proj_b.bias.float(), delta_softplus=True,)
+                v_out = mamba_inner_fn_no_out_proj(v_xz, self.v_conv1d.weight, self.v_conv1d.bias, self.v_x_proj.weight, self.v_dt_proj.weight, v_A, None, None, self.v_D.float(), delta_bias=self.v_dt_proj.bias.float(), delta_softplus=True,)
+                v_out_b = mamba_inner_fn_no_out_proj(v_xz.flip([-1]), self.v_conv1d_b.weight, self.v_conv1d_b.bias, self.v_x_proj_b.weight, self.v_dt_proj_b.weight, v_A_b, None, None, self.v_D_b.float(), delta_bias=self.v_dt_proj_b.bias.float(), delta_softplus=True,)
                 if not self.if_devide_out:
                     a_out = F.linear(rearrange(a_out + a_out_b.flip([-1]), "b d l -> b l d"), self.a_out_proj.weight, self.a_out_proj.bias)
                     v_out = F.linear(rearrange(v_out + v_out_b.flip([-1]), "b d l -> b l d"), self.v_out_proj.weight, self.v_out_proj.bias)
@@ -137,8 +143,8 @@ class Mamba(nn.Module):
                     a_out = F.linear(rearrange(0.5*a_out + 0.5*a_out_b.flip([-1]), "b d l -> b l d"), self.a_out_proj.weight, self.a_out_proj.bias)
                     v_out = F.linear(rearrange(0.5*v_out + 0.5*v_out_b.flip([-1]), "b d l -> b l d"), self.v_out_proj.weight, self.v_out_proj.bias)
             else:
-                a_out = mamba_inner_fn(a_xz, self.a_conv1d.weight, self.a_conv1d.bias, self.a_x_proj.weight, self.a_dt_proj.weight, self.a_out_proj.weight, self.a_out_proj.bias, A, None, None, self.a_D.float(), delta_bias=self.a_dt_proj.bias.float(), delta_softplus=True,)
-                v_out = mamba_inner_fn(v_xz, self.v_conv1d.weight, self.v_conv1d.bias, self.v_x_proj.weight, self.v_dt_proj.weight, self.v_out_proj.weight, self.v_out_proj.bias, A, None, None, self.v_D.float(), delta_bias=self.v_dt_proj.bias.float(), delta_softplus=True,)
+                a_out = mamba_inner_fn(a_xz, self.a_conv1d.weight, self.a_conv1d.bias, self.a_x_proj.weight, self.a_dt_proj.weight, self.a_out_proj.weight, self.a_out_proj.bias, a_A, None, None, self.a_D.float(), delta_bias=self.a_dt_proj.bias.float(), delta_softplus=True,)
+                v_out = mamba_inner_fn(v_xz, self.v_conv1d.weight, self.v_conv1d.bias, self.v_x_proj.weight, self.v_dt_proj.weight, self.v_out_proj.weight, self.v_out_proj.bias, v_A, None, None, self.v_D.float(), delta_bias=self.v_dt_proj.bias.float(), delta_softplus=True,)
         else:
             a_x, a_z = a_xz.chunk(2, dim=1)
             v_x, v_z = v_xz.chunk(2, dim=1)
@@ -166,8 +172,8 @@ class Mamba(nn.Module):
             v_B = rearrange(v_B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             v_C = rearrange(v_C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             assert self.activation in ["silu", "swish"]
-            a_y = selective_scan_fn(a_x, a_dt, A, a_B, a_C, self.a_D.float(), z=a_z, delta_bias=self.a_dt_proj.bias.float(), delta_softplus=True, return_last_state=a_ssm_state is not None,)
-            v_y = selective_scan_fn(v_x, v_dt, A, v_B, v_C, self.v_D.float(), z=v_z, delta_bias=self.v_dt_proj.bias.float(), delta_softplus=True, return_last_state=v_ssm_state is not None,)
+            a_y = selective_scan_fn(a_x, a_dt, a_A, a_B, a_C, self.a_D.float(), z=a_z, delta_bias=self.a_dt_proj.bias.float(), delta_softplus=True, return_last_state=a_ssm_state is not None,)
+            v_y = selective_scan_fn(v_x, v_dt, v_A, v_B, v_C, self.v_D.float(), z=v_z, delta_bias=self.v_dt_proj.bias.float(), delta_softplus=True, return_last_state=v_ssm_state is not None,)
             if a_ssm_state is not None:
                 a_y, a_last_state = a_y
                 a_ssm_state.copy_(a_last_state)
@@ -212,25 +218,26 @@ class Mamba(nn.Module):
         v_x_db = self.v_x_proj(v_x)
         v_dt, v_B, v_C = torch.split(v_x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
         v_dt = F.linear(v_dt, self.v_dt_proj.weight)
-        A = -torch.exp(self.A_log.float())
+        a_A = -torch.exp(self.a_A_log.float())
+        v_A = -torch.exp(self.v_A_log.float())
         if selective_state_update is None:
             a_dt = F.softplus(a_dt + self.a_dt_proj.bias.to(dtype=a_dt.dtype))
-            a_dA = torch.exp(torch.einsum("bd,dn->bdn", a_dt, A))
+            a_dA = torch.exp(torch.einsum("bd,dn->bdn", a_dt, a_A))
             a_dB = torch.einsum("bd,bn->bdn", a_dt, a_B)
             a_ssm_state.copy_(a_ssm_state * a_dA + rearrange(a_x, "b d -> b d 1") * a_dB)
             a_y = torch.einsum("bdn,bn->bd", a_ssm_state.to(dtype), a_C)
             a_y = a_y + self.a_D.to(dtype) * a_x
             a_y = a_y * self.act(a_z)
             v_dt = F.softplus(v_dt + self.v_dt_proj.bias.to(dtype=v_dt.dtype))
-            v_dA = torch.exp(torch.einsum("bd,dn->bdn", v_dt, A))
+            v_dA = torch.exp(torch.einsum("bd,dn->bdn", v_dt, v_A))
             v_dB = torch.einsum("bd,bn->bdn", v_dt, v_B)
             v_ssm_state.copy_(v_ssm_state * v_dA + rearrange(v_x, "b d -> b d 1") * v_dB)
             v_y = torch.einsum("bdn,bn->bd", v_ssm_state.to(dtype), v_C)
             v_y = v_y + self.v_D.to(dtype) * v_x
             v_y = v_y * self.act(v_z)
         else:
-            a_y = selective_state_update(a_ssm_state, a_x, a_dt, A, a_B, a_C, self.a_D, z=a_z, dt_bias=self.a_dt_proj.bias, dt_softplus=True)
-            v_y = selective_state_update(v_ssm_state, v_x, v_dt, A, v_B, v_C, self.v_D, z=v_z, dt_bias=self.v_dt_proj.bias, dt_softplus=True)
+            a_y = selective_state_update(a_ssm_state, a_x, a_dt, a_A, a_B, a_C, self.a_D, z=a_z, dt_bias=self.a_dt_proj.bias, dt_softplus=True)
+            v_y = selective_state_update(v_ssm_state, v_x, v_dt, v_A, v_B, v_C, self.v_D, z=v_z, dt_bias=self.v_dt_proj.bias, dt_softplus=True)
         a_out = self.a_out_proj(a_y)
         v_out = self.v_out_proj(v_y)
         return a_out.unsqueeze(1), a_conv_state, a_ssm_state, v_out.unsqueeze(1), v_conv_state, v_ssm_state
