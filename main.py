@@ -74,6 +74,22 @@ def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, to
             ortho_loss = torch.mean(torch.sum(F.normalize(za, dim=-1) * F.normalize(zv, dim=-1), dim=-1)**2)
             alpha = 0.1
             loss = cls_loss + alpha * ortho_loss
+            
+            # ========== [DEBUG 探针 2: 验证正交 Loss 是否激活] ==========
+            # 仅在 Epoch 0 的第一个 Batch 打印，防止刷屏
+            if current_epoch == 0 and sample_count == 0:
+                print(f"\n" + "-"*50)
+                print(f"📊 [前向传播审查]: 第一批次特征提取状态")
+                print(f" -> Za 维度: {za.shape} | Zv 维度: {zv.shape}")
+                print(f" -> 主分类 Loss (CLS) : {cls_loss.item():.6f}")
+                print(f" -> 正交惩罚 Loss (Ortho) : {ortho_loss.item():.6f} (权重 alpha={alpha})")
+                print(f" -> 联合总 Loss : {loss.item():.6f}")
+                if ortho_loss.item() > 0:
+                    print("✅ 确诊: 正交 Loss 已成功计算，即将执行联合梯度回传！")
+                else:
+                    print("❌ 致命错误: 正交 Loss 为 0，正交切除术失效！")
+                print("-" * 50 + "\n")
+            # ========================================================
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
@@ -156,6 +172,25 @@ def main():
         else:
             raise NotImplementedError(f"The {args.model} method has not been implemented by this repo")
         net = net.to(args.device[0])
+        
+        # ========== [DEBUG 探针 1: Mamba 参数解耦验证] ==========
+        if i_iter == 0: # 仅在第一次大循环时打印
+            print("\n" + "="*50)
+            print("🔬 [架构审查]: 验证动力学矩阵 A 的解耦状态")
+            param_names = [name for name, _ in net.named_parameters()]
+            has_a_A = any("a_A_log" in name for name in param_names)
+            has_v_A = any("v_A_log" in name for name in param_names)
+            has_shared_A = any("A_log" in name and "a_A_log" not in name and "v_A_log" not in name for name in param_names)
+            
+            if has_a_A and has_v_A:
+                print("✅ 确诊: a_A_log 和 v_A_log 已成功独立注册至计算图！")
+            else:
+                print("❌ 警告: 未检测到独立解耦的 A 参数，手术失败！")
+                
+            if has_shared_A:
+                print("⚠️ 警告: 仍然检测到残留的共享 A_log 参数，请检查是否删干净了！")
+            print("="*50 + "\n")
+        # ========================================================
         
         if len(args.device) > 1:
             net = torch.nn.DataParallel(net, device_ids=args.device)
