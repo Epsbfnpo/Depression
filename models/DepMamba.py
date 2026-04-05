@@ -38,6 +38,8 @@ class BottleneckFusion(nn.Module):
             nn.Linear(d_model * 2, d_model),
         )
         self.norm_ffn = nn.LayerNorm(d_model)
+        self.alpha_a = nn.Parameter(torch.tensor(1.0))
+        self.alpha_v = nn.Parameter(torch.tensor(1.0))
         self.forward_called = False
 
     def forward(self, xa, xv, padding_mask=None):
@@ -63,7 +65,7 @@ class BottleneckFusion(nn.Module):
             value=xv_norm,
             key_padding_mask=key_padding_mask,
         )
-        b_fused = b_tokens + b_a + b_v
+        b_fused = b_tokens + (self.alpha_a * b_a) + (self.alpha_v * b_v)
         b_out = b_fused + self.ffn(self.norm_ffn(b_fused))
         return b_out
 
@@ -122,8 +124,8 @@ class MMCNNEncoderLayer(nn.Module):
             xa = self.a_skipconv(xa)
         if self.v_skipconv is not None:
             xv = self.v_skipconv(xv)
-        a_out = a_out+xa
-        v_out = v_out+xv
+        a_out = self.relu(a_out + xa)
+        v_out = self.relu(v_out + xv)
         return a_out, v_out
 
 class MambaEncoderLayer(nn.Module):
@@ -182,21 +184,25 @@ class CoSSM(nn.Module):
         print(f'dropout={str(dropout)} is not used in Mamba.')
         prev_input_size = input_size
         cnn_list = []
-        mamba_list = []
+        a_mamba_list = []
+        v_mamba_list = []
         for i in range(len(output_sizes)):
             cnn_list.append(MMCNNEncoderLayer(input_size = input_size if i<1 else output_sizes[i-1], output_size = output_sizes[i], dropout=dropout))
-            mamba_list.append(MMMambaEncoderLayer(d_model=output_sizes[i], d_ffn=d_ffn, dropout=dropout, activation=activation, causal=causal, mamba_config=mamba_config,))
-        self.mamba_layers = torch.nn.ModuleList(mamba_list)
+            a_mamba_list.append(MambaEncoderLayer(d_model=output_sizes[i], d_ffn=d_ffn, dropout=dropout, activation=activation, causal=causal, mamba_config=mamba_config,))
+            v_mamba_list.append(MambaEncoderLayer(d_model=output_sizes[i], d_ffn=d_ffn, dropout=dropout, activation=activation, causal=causal, mamba_config=mamba_config,))
+        self.a_mamba_layers = torch.nn.ModuleList(a_mamba_list)
+        self.v_mamba_layers = torch.nn.ModuleList(v_mamba_list)
         self.cnn_layers = torch.nn.ModuleList(cnn_list)
 
     def forward(self, a_x, v_x, a_inference_params = None, v_inference_params = None):
         a_out = a_x
         v_out = v_x
-        for cnn_layer, mamba_layer in zip(self.cnn_layers, self.mamba_layers):
+        for cnn_layer, a_mamba_layer, v_mamba_layer in zip(self.cnn_layers, self.a_mamba_layers, self.v_mamba_layers):
             a_out, v_out  = cnn_layer(a_out.permute(0,2,1), v_out.permute(0,2,1))
             a_out = a_out.permute(0,2,1)
             v_out = v_out.permute(0,2,1)
-            a_out, v_out = mamba_layer(a_out, v_out, a_inference_params = a_inference_params, v_inference_params = v_inference_params)
+            a_out = a_mamba_layer(a_out, inference_params=a_inference_params)
+            v_out = v_mamba_layer(v_out, inference_params=v_inference_params)
         return a_out, v_out
 
 class EnSSM(nn.Module):
