@@ -16,6 +16,59 @@ from .mamba.bimamba import Mamba as BiMamba
 from .mamba.mm_bimamba import Mamba as MMBiMamba 
 from .base import BaseNet
 
+class BottleneckFusion(nn.Module):
+    def __init__(self, d_model=256, num_bottlenecks=4, nhead=4, dropout=0.3):
+        super().__init__()
+        self.d_model = d_model
+        self.num_bottlenecks = num_bottlenecks
+        self.bottlenecks = nn.Parameter(torch.randn(1, num_bottlenecks, d_model))
+        self.cross_attn_a = nn.MultiheadAttention(
+            embed_dim=d_model, num_heads=nhead, dropout=dropout, batch_first=True
+        )
+        self.cross_attn_v = nn.MultiheadAttention(
+            embed_dim=d_model, num_heads=nhead, dropout=dropout, batch_first=True
+        )
+        self.norm_a = nn.LayerNorm(d_model)
+        self.norm_v = nn.LayerNorm(d_model)
+        self.norm_b = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 2, d_model),
+        )
+        self.norm_ffn = nn.LayerNorm(d_model)
+        self.alpha_a = nn.Parameter(torch.tensor(1.0))
+        self.alpha_v = nn.Parameter(torch.tensor(1.0))
+        self.forward_called = False
+
+    def forward(self, xa, xv, padding_mask=None):
+        self.forward_called = True
+        b_size = xa.size(0)
+        key_padding_mask = None
+        if padding_mask is not None:
+            key_padding_mask = padding_mask == 0
+        b_tokens = self.bottlenecks.expand(b_size, -1, -1)
+        b_tokens_norm = self.norm_b(b_tokens)
+        xa_norm = self.norm_a(xa)
+        xv_norm = self.norm_v(xv)
+
+        b_a, _ = self.cross_attn_a(
+            query=b_tokens_norm,
+            key=xa_norm,
+            value=xa_norm,
+            key_padding_mask=key_padding_mask,
+        )
+        b_v, _ = self.cross_attn_v(
+            query=b_tokens_norm,
+            key=xv_norm,
+            value=xv_norm,
+            key_padding_mask=key_padding_mask,
+        )
+        b_fused = b_tokens + (self.alpha_a * b_a) + (self.alpha_v * b_v)
+        b_out = b_fused + self.ffn(self.norm_ffn(b_fused))
+        return b_out
+
 class CNNEncoderLayer(nn.Module):
     def __init__(self, input_size, output_size, dropout=0.0, causal=False, dilation=1,):
         super().__init__()
@@ -71,8 +124,8 @@ class MMCNNEncoderLayer(nn.Module):
             xa = self.a_skipconv(xa)
         if self.v_skipconv is not None:
             xv = self.v_skipconv(xv)
-        a_out = a_out+xa
-        v_out = v_out+xv
+        a_out = self.relu(a_out + xa)
+        v_out = self.relu(v_out + xv)
         return a_out, v_out
 
 class MambaEncoderLayer(nn.Module):
@@ -131,21 +184,25 @@ class CoSSM(nn.Module):
         print(f'dropout={str(dropout)} is not used in Mamba.')
         prev_input_size = input_size
         cnn_list = []
-        mamba_list = []
+        a_mamba_list = []
+        v_mamba_list = []
         for i in range(len(output_sizes)):
             cnn_list.append(MMCNNEncoderLayer(input_size = input_size if i<1 else output_sizes[i-1], output_size = output_sizes[i], dropout=dropout))
-            mamba_list.append(MMMambaEncoderLayer(d_model=output_sizes[i], d_ffn=d_ffn, dropout=dropout, activation=activation, causal=causal, mamba_config=mamba_config,))
-        self.mamba_layers = torch.nn.ModuleList(mamba_list)
+            a_mamba_list.append(MambaEncoderLayer(d_model=output_sizes[i], d_ffn=d_ffn, dropout=dropout, activation=activation, causal=causal, mamba_config=mamba_config,))
+            v_mamba_list.append(MambaEncoderLayer(d_model=output_sizes[i], d_ffn=d_ffn, dropout=dropout, activation=activation, causal=causal, mamba_config=mamba_config,))
+        self.a_mamba_layers = torch.nn.ModuleList(a_mamba_list)
+        self.v_mamba_layers = torch.nn.ModuleList(v_mamba_list)
         self.cnn_layers = torch.nn.ModuleList(cnn_list)
 
     def forward(self, a_x, v_x, a_inference_params = None, v_inference_params = None):
         a_out = a_x
         v_out = v_x
-        for cnn_layer, mamba_layer in zip(self.cnn_layers, self.mamba_layers):
+        for cnn_layer, a_mamba_layer, v_mamba_layer in zip(self.cnn_layers, self.a_mamba_layers, self.v_mamba_layers):
             a_out, v_out  = cnn_layer(a_out.permute(0,2,1), v_out.permute(0,2,1))
             a_out = a_out.permute(0,2,1)
             v_out = v_out.permute(0,2,1)
-            a_out, v_out = mamba_layer(a_out, v_out, a_inference_params = a_inference_params, v_inference_params = v_inference_params)
+            a_out = a_mamba_layer(a_out, inference_params=a_inference_params)
+            v_out = v_mamba_layer(v_out, inference_params=v_inference_params)
         return a_out, v_out
 
 class EnSSM(nn.Module):
@@ -171,31 +228,61 @@ class EnSSM(nn.Module):
 
 class DepMamba(BaseNet):
     def __init__(self, audio_input_size=161, video_input_size=161, mm_input_size=128, mm_output_sizes=[256,64], d_ffn=1024, num_layers=8, dropout=0.1, activation='Swish', causal=False, mamba_config=None):
-        super().__init__()
-        self.cossm_encoder = CoSSM(num_layers, mm_input_size, mm_output_sizes, d_ffn, activation=activation, dropout=dropout, causal=causal, mamba_config=mamba_config)
+        super(DepMamba, self).__init__()
         self.conv_audio = nn.Conv1d(audio_input_size, mm_input_size, 1, padding=0, dilation=1, bias=False)
         self.conv_video = nn.Conv1d(video_input_size, mm_input_size, 1, padding=0, dilation=1, bias=False)
-        self.enssm_encoder = EnSSM(num_layers, mm_output_sizes[-1]*2, [mm_output_sizes[-1]*2], d_ffn, activation=activation, dropout=dropout, causal=causal, mamba_config=mamba_config)
-        self.pool = nn.AdaptiveMaxPool1d(1)
-        self.output = nn.Linear(mm_output_sizes[-1]*2, 1)
-        self.m = nn.Sigmoid()
+        self.cossm_encoder = CoSSM(
+            num_layers=num_layers,
+            input_size=mm_input_size,
+            output_sizes=[mm_input_size] * num_layers,
+            d_ffn=d_ffn,
+            activation=activation,
+            dropout=dropout,
+            causal=causal,
+            mamba_config=mamba_config
+        )
+        self.bottleneck_fusion = BottleneckFusion(
+            d_model=mm_input_size,
+            num_bottlenecks=4,
+            nhead=4,
+            dropout=max(dropout, 0.3)
+        )
+        self.output = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(mm_input_size, mm_input_size // 2),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(mm_input_size // 2, 2)
+        )
+        self.feature_extractor_called = False
         nn.init.xavier_uniform_(self.conv_audio.weight.data)
         nn.init.xavier_uniform_(self.conv_video.weight.data)
 
     def feature_extractor(self, x, padding_mask=None, a_inference_params = None, v_inference_params = None):
+        self.feature_extractor_called = True
         xa = x[:, :, 136:]
         xv = x[:, :, :136]
         xa = self.conv_audio(xa.permute(0,2,1)).permute(0,2,1)
         xv = self.conv_video(xv.permute(0,2,1)).permute(0,2,1)
-        xa, xv = self.cossm_encoder(xa, xv, a_inference_params, v_inference_params)
-        x = torch.cat([xa,xv],dim=-1)
-        x = self.enssm_encoder(x)
-        if padding_mask is not None:
-            x = x * (padding_mask.unsqueeze(-1).float())
-            x = x.sum(dim=1) / (padding_mask.unsqueeze(-1).float()).sum(dim=1, keepdim=False)
-        else:
-            x = self.pool(x.permute(0,2,1)).squeeze(-1)
-        return x
+        xa_out, xv_out = self.cossm_encoder(xa, xv, a_inference_params, v_inference_params)
+        b_out = self.bottleneck_fusion(xa_out, xv_out, padding_mask)
+        global_feature = b_out.mean(dim=1)
+        return global_feature
 
     def classifier(self, x):
         return self.output(x)
+
+    def reset_silent_failure_flags(self):
+        self.feature_extractor_called = False
+        self.bottleneck_fusion.forward_called = False
+
+    def assert_new_path_executed(self):
+        if not self.feature_extractor_called:
+            raise RuntimeError("Silent failure detected: DepMamba.feature_extractor was not executed.")
+        if not self.bottleneck_fusion.forward_called:
+            raise RuntimeError("Silent failure detected: BottleneckFusion.forward was not executed.")
+
+    def forward(self, x, padding_mask=None):
+        x = self.feature_extractor(x, padding_mask)
+        out = self.output(x)
+        return out
