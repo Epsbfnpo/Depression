@@ -76,7 +76,7 @@ class CNNEncoderLayer(nn.Module):
         self.bn1 = nn.BatchNorm1d(output_size)
         self.relu1 = nn.ReLU()
         self.drop = nn.Dropout(dropout)
-        self.net = nn.Sequential(self.conv1, self.bn1, self.relu1, self.drop)
+        self.net = nn.Sequential(self.conv1, self.bn1, self.drop)
         if input_size != output_size:
             self.conv = nn.Conv1d(input_size, output_size, 1, padding=0, dilation=dilation, bias=False)
         else:
@@ -103,8 +103,8 @@ class MMCNNEncoderLayer(nn.Module):
         self.relu = nn.ReLU()
         self.a_drop = nn.Dropout(dropout)
         self.v_drop = nn.Dropout(dropout)
-        self.a_net = nn.Sequential(self.a_conv, self.a_bn, self.relu, self.a_drop)
-        self.v_net = nn.Sequential(self.v_conv, self.v_bn, self.relu, self.v_drop)
+        self.a_net = nn.Sequential(self.a_conv, self.a_bn, self.a_drop)
+        self.v_net = nn.Sequential(self.v_conv, self.v_bn, self.v_drop)
         if input_size != output_size:
             self.a_skipconv = nn.Conv1d(input_size, output_size, 1, padding=0, dilation=dilation, bias=False)
             self.v_skipconv = nn.Conv1d(input_size, output_size, 1, padding=0, dilation=dilation, bias=False)
