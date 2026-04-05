@@ -1,0 +1,40 @@
+[Device] primary=cuda:0, data_parallel_ids=None
+
+=======================================================
+[INFO] Starting Iteration 0 with Random Seed: 42
+=======================================================
+
+Namespace(data_dir='/datasets/work/hb-nhmrc-dhcp/work/liu275/Depression/DVLOG_Feature/dvlog', train_gender='both', test_gender='both', model='DepMamba', epochs=120, batch_size=16, learning_rate=8e-05, dataset='dvlog', gpu='0', if_wandb=False, tqdm_able=None, train=True, lr_scheduler='cos', save_dir='/datasets/work/hb-nhmrc-dhcp/work/liu275/Depression/DepMamba/mambamodels', device=['cuda'], mmmamba={'audio_input_size': 25, 'video_input_size': 136, 'mm_input_size': 256, 'mm_output_sizes': [256], 'dropout': 0.1, 'd_ffn': 1024, 'num_layers': 1, 'activation': 'GELU', 'causal': False, 'mamba_config': {'d_state': 12, 'expand': 4, 'd_conv': 4, 'bidirectional': True}}, mmmamba_lmvd={'audio_input_size': 128, 'video_input_size': 136, 'mm_input_size': 256, 'mm_output_sizes': [256], 'dropout': 0.1, 'd_ffn': 1024, 'num_layers': 1, 'activation': 'GELU', 'causal': False, 'mamba_config': {'d_state': 16, 'expand': 4, 'd_conv': 4, 'bidirectional': True}})
+dropout=0.1 is not used in Mamba.
+dropout=0.1 is not used in Mamba.
+ALL:1248, Positive:771, Negative:477
+ALL:102, Positive:57, Negative:45
+ALL:212, Positive:123, Negative:89
+Test results:
+{'loss': 0.7320338172732659, 'acc': 0.7028301886792453, 'precision': 0.689873417721519, 'recall': 0.8861788617886179, 'f1': 0.7758007117437722}
+
+=======================================================
+[INFO] Starting Iteration 1 with Random Seed: 43
+=======================================================
+
+Namespace(data_dir='/datasets/work/hb-nhmrc-dhcp/work/liu275/Depression/DVLOG_Feature/dvlog', train_gender='both', test_gender='both', model='DepMamba', epochs=120, batch_size=16, learning_rate=8e-05, dataset='dvlog', gpu='0', if_wandb=False, tqdm_able=None, train=True, lr_scheduler='cos', save_dir='/datasets/work/hb-nhmrc-dhcp/work/liu275/Depression/DepMamba/mambamodels', device=['cuda'], mmmamba={'audio_input_size': 25, 'video_input_size': 136, 'mm_input_size': 256, 'mm_output_sizes': [256], 'dropout': 0.1, 'd_ffn': 1024, 'num_layers': 1, 'activation': 'GELU', 'causal': False, 'mamba_config': {'d_state': 12, 'expand': 4, 'd_conv': 4, 'bidirectional': True}}, mmmamba_lmvd={'audio_input_size': 128, 'video_input_size': 136, 'mm_input_size': 256, 'mm_output_sizes': [256], 'dropout': 0.1, 'd_ffn': 1024, 'num_layers': 1, 'activation': 'GELU', 'causal': False, 'mamba_config': {'d_state': 16, 'expand': 4, 'd_conv': 4, 'bidirectional': True}})
+dropout=0.1 is not used in Mamba.
+dropout=0.1 is not used in Mamba.
+ALL:1215, Positive:747, Negative:468
+ALL:102, Positive:57, Negative:45
+ALL:212, Positive:123, Negative:89
+Test results:
+{'loss': 0.8239154478289047, 'acc': 0.6886792452830188, 'precision': 0.6912751677852349, 'recall': 0.8373983739837398, 'f1': 0.7573529411764706}
+
+=======================================================
+[INFO] Starting Iteration 2 with Random Seed: 44
+=======================================================
+
+Namespace(data_dir='/datasets/work/hb-nhmrc-dhcp/work/liu275/Depression/DVLOG_Feature/dvlog', train_gender='both', test_gender='both', model='DepMamba', epochs=120, batch_size=16, learning_rate=8e-05, dataset='dvlog', gpu='0', if_wandb=False, tqdm_able=None, train=True, lr_scheduler='cos', save_dir='/datasets/work/hb-nhmrc-dhcp/work/liu275/Depression/DepMamba/mambamodels', device=['cuda'], mmmamba={'audio_input_size': 25, 'video_input_size': 136, 'mm_input_size': 256, 'mm_output_sizes': [256], 'dropout': 0.1, 'd_ffn': 1024, 'num_layers': 1, 'activation': 'GELU', 'causal': False, 'mamba_config': {'d_state': 12, 'expand': 4, 'd_conv': 4, 'bidirectional': True}}, mmmamba_lmvd={'audio_input_size': 128, 'video_input_size': 136, 'mm_input_size': 256, 'mm_output_sizes': [256], 'dropout': 0.1, 'd_ffn': 1024, 'num_layers': 1, 'activation': 'GELU', 'causal': False, 'mamba_config': {'d_state': 16, 'expand': 4, 'd_conv': 4, 'bidirectional': True}})
+dropout=0.1 is not used in Mamba.
+dropout=0.1 is not used in Mamba.
+ALL:1215, Positive:745, Negative:470
+ALL:102, Positive:57, Negative:45
+ALL:212, Positive:123, Negative:89
+Test results:
+{'loss': 1.4113188644625105, 'acc': 0.6226415094339622, 'precision': 0.6287425149700598, 'recall': 0.8536585365853658, 'f1': 0.7241379310344828}
