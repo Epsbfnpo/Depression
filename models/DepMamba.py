@@ -17,7 +17,7 @@ from .mamba.mm_bimamba import Mamba as MMBiMamba
 from .base import BaseNet
 
 class BottleneckFusion(nn.Module):
-    def __init__(self, d_model=256, num_bottlenecks=4, nhead=8, dropout=0.1):
+    def __init__(self, d_model=256, num_bottlenecks=4, nhead=4, dropout=0.3):
         super().__init__()
         self.d_model = d_model
         self.num_bottlenecks = num_bottlenecks
@@ -32,10 +32,10 @@ class BottleneckFusion(nn.Module):
         self.norm_v = nn.LayerNorm(d_model)
         self.norm_b = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_model * 4),
+            nn.Linear(d_model, d_model * 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model * 4, d_model),
+            nn.Linear(d_model * 2, d_model),
         )
         self.norm_ffn = nn.LayerNorm(d_model)
         self.forward_called = False
@@ -225,23 +225,27 @@ class DepMamba(BaseNet):
         super(DepMamba, self).__init__()
         self.conv_audio = nn.Conv1d(audio_input_size, mm_input_size, 1, padding=0, dilation=1, bias=False)
         self.conv_video = nn.Conv1d(video_input_size, mm_input_size, 1, padding=0, dilation=1, bias=False)
-        self.cossm_encoder = MMMambaEncoderLayer(
-            d_model=mm_input_size,
+        self.cossm_encoder = CoSSM(
+            num_layers=num_layers,
+            input_size=mm_input_size,
+            output_sizes=[mm_input_size] * num_layers,
             d_ffn=d_ffn,
-            dropout=dropout,
             activation=activation,
+            dropout=dropout,
+            causal=causal,
             mamba_config=mamba_config
         )
         self.bottleneck_fusion = BottleneckFusion(
             d_model=mm_input_size,
             num_bottlenecks=4,
-            nhead=8,
-            dropout=dropout
+            nhead=4,
+            dropout=max(dropout, 0.3)
         )
         self.output = nn.Sequential(
-            nn.Dropout(dropout),
+            nn.Dropout(0.5),
             nn.Linear(mm_input_size, mm_input_size // 2),
             nn.ReLU(),
+            nn.Dropout(0.3),
             nn.Linear(mm_input_size // 2, 2)
         )
         self.feature_extractor_called = False
