@@ -3,13 +3,34 @@ import torch
 import torch.nn as nn
 from functools import partial
 from mamba_ssm import Mamba
-from modules.mamba.bimamba import Mamba as BiMamba 
-from modules.mamba.bimamba import Block as PreNormBlock
+from .bimamba import Mamba as BiMamba 
+from .bimamba import Block as PreNormBlock
 
 try:
     from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
 except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
+
+
+class MambaBlock(nn.Module):
+    """A lightweight residual Mamba block for sequence modeling."""
+
+    def __init__(self, d_model: int, d_state: int = 16, expand: int = 2, d_conv: int = 4, bidirectional: bool = True):
+        super().__init__()
+        ssm_cfg = {
+            "d_state": d_state,
+            "expand": expand,
+            "d_conv": d_conv,
+        }
+        if bidirectional:
+            ssm_cfg["bimamba_type"] = "v2"
+            self.mamba = BiMamba(d_model=d_model, **ssm_cfg)
+        else:
+            self.mamba = Mamba(d_model=d_model, **ssm_cfg)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        return x + self.mamba(self.norm(x))
 
 def create_block(d_model, ssm_cls=None, ssm_cfg=None, norm_epsilon=1e-5, rms_norm=False, residual_in_fp32=False, fused_add_norm=True, layer_idx=None, device=None, dtype=None,):
     if ssm_cfg is None:
