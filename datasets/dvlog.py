@@ -7,6 +7,23 @@ import torch
 from torch.utils import data
 
 
+def apply_feature_masking(tensor, time_mask_ratio=0.1, channel_mask_ratio=0.1):
+    """Feature-level SpecAugment: random contiguous time masking + random channel masking."""
+    T, D = tensor.shape
+
+    if random.random() < 0.5:
+        mask_len = max(1, int(T * time_mask_ratio))
+        start = random.randint(0, T - mask_len)
+        tensor[start:start + mask_len, :] = 0.0
+
+    if random.random() < 0.5:
+        num_channels_to_mask = max(1, int(D * channel_mask_ratio))
+        channels = random.sample(range(D), num_channels_to_mask)
+        tensor[:, channels] = 0.0
+
+    return tensor
+
+
 class DVlog(data.Dataset):
     def __init__(self, root: Union[str, Path], fold: str = "train", gender: str = "both", transform=None, target_transform=None, aug: bool = False):
         self.root = root if isinstance(root, Path) else Path(root)
@@ -59,6 +76,10 @@ class DVlog(data.Dataset):
         v_tensor = torch.tensor(v_feature, dtype=torch.float32)
         a_tensor = torch.tensor(a_feature, dtype=torch.float32)
         label_tensor = torch.tensor(label, dtype=torch.long)
+
+        if self.fold == "train":
+            v_tensor = apply_feature_masking(v_tensor)
+            a_tensor = apply_feature_masking(a_tensor)
 
         if self.transform is not None:
             v_tensor = self.transform(v_tensor)

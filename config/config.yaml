@@ -20,11 +20,11 @@ mmmamba:
   video_input_size: 136
   mm_input_size: 128
   mm_output_sizes: [128]
-  dropout: 0.4
+  dropout: 0.3
   d_ffn: 1024 
   num_layers: 4
-  num_bottlenecks: 4
-  nhead: 8
+  num_bottlenecks: 2
+  nhead: 4
   activation: 'GELU'
   causal: false
 
@@ -39,11 +39,11 @@ mmmamba_lmvd:
   video_input_size: 136
   mm_input_size: 128
   mm_output_sizes: [128]
-  dropout: 0.4
+  dropout: 0.3
   d_ffn: 1024 
   num_layers: 4
-  num_bottlenecks: 4
-  nhead: 8
+  num_bottlenecks: 2
+  nhead: 4
   activation: 'GELU'
   causal: false
 

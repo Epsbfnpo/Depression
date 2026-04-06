@@ -8,7 +8,7 @@ from .mamba.mamba_blocks import MambaBlock
 
 
 class TrueBottleneckBlock(nn.Module):
-    def __init__(self, d_model, max_len=50000, num_bottlenecks=4, nhead=8):
+    def __init__(self, d_model, max_len=50000, num_bottlenecks=2, nhead=4):
         super().__init__()
 
         pe = torch.zeros(max_len, d_model)
@@ -98,10 +98,11 @@ class DepMamba(BaseNet):
         video_input_size=161,
         mm_input_size=128,
         num_layers=3,
-        num_bottlenecks=4,
-        nhead=8,
+        num_bottlenecks=2,
+        nhead=4,
         num_classes=2,
         mamba_config=None,
+        dropout=0.3,
         **kwargs,
     ):
         super().__init__()
@@ -113,6 +114,7 @@ class DepMamba(BaseNet):
         self.proj_v = nn.Linear(video_input_size, mm_input_size)
 
         self.latent_tokens = nn.Parameter(torch.randn(1, num_bottlenecks, mm_input_size))
+        self.dropout_layer = nn.Dropout(dropout)
 
         cfg = mamba_config or {}
         self.mamba_layers_a = nn.ModuleList(
@@ -154,18 +156,31 @@ class DepMamba(BaseNet):
         self.output = nn.Sequential(
             nn.Linear(mm_input_size, mm_input_size // 2),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(mm_input_size // 2, num_classes),
         )
 
     def feature_extractor(self, audio, video):
         self.feature_extractor_called = True
+
         xa = self.proj_a(audio)
         xv = self.proj_v(video)
+
+        if self.training:
+            if torch.rand(1).item() < 0.15:
+                xa = torch.zeros_like(xa)
+            if torch.rand(1).item() < 0.15:
+                xv = torch.zeros_like(xv)
+
         latents = self.latent_tokens.expand(xa.size(0), -1, -1)
 
         for i in range(self.num_layers):
-            xa = self.mamba_layers_a[i](xa)
-            xv = self.mamba_layers_v[i](xv)
+            xa_m = self.mamba_layers_a[i](xa)
+            xv_m = self.mamba_layers_v[i](xv)
+
+            xa = self.dropout_layer(xa_m)
+            xv = self.dropout_layer(xv_m)
+
             xa, xv, latents = self.bottleneck_blocks[i](xa, xv, latents)
 
         self.bottleneck_forward_called = True
@@ -187,5 +202,4 @@ class DepMamba(BaseNet):
 
     def forward(self, audio, video):
         x = self.feature_extractor(audio, video)
-        out = self.output(x)
-        return out
+        return self.output(x)
