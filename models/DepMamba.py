@@ -69,6 +69,28 @@ class BottleneckFusion(nn.Module):
         b_out = b_fused + self.ffn(self.norm_ffn(b_fused))
         return b_out
 
+class SaliencyGuidedMasking(nn.Module):
+    def __init__(self, mask_ratio=0.3, prob=0.5):
+        super().__init__()
+        self.mask_ratio = mask_ratio
+        self.prob = prob
+
+    def forward(self, x):
+        if not self.training or self.mask_ratio <= 0:
+            return x
+        b_size, seq_len, _ = x.size()
+        saliency = torch.norm(x, p=2, dim=-1)
+        k = int(seq_len * self.mask_ratio)
+        if k == 0:
+            return x
+        k_th_idx = max(seq_len - k, 1)
+        threshold = torch.kthvalue(saliency, k_th_idx, dim=1).values.unsqueeze(-1)
+        is_salient = saliency >= threshold
+        random_drop = torch.rand_like(saliency) < self.prob
+        drop_mask = is_salient & random_drop
+        keep_mask = (~drop_mask).unsqueeze(-1).float()
+        return x * keep_mask
+
 class CNNEncoderLayer(nn.Module):
     def __init__(self, input_size, output_size, dropout=0.0, causal=False, dilation=1,):
         super().__init__()
@@ -255,9 +277,9 @@ class DepMamba(BaseNet):
             nn.Dropout(0.3),
             nn.Linear(mm_input_size // 2, 2)
         )
+        self.sg_mask_a = SaliencyGuidedMasking(mask_ratio=0.2, prob=0.5)
+        self.sg_mask_v = SaliencyGuidedMasking(mask_ratio=0.2, prob=0.5)
         self.feature_extractor_called = False
-        self.time_mask_prob = 0.3
-        self.time_mask_width = 50
         nn.init.xavier_uniform_(self.conv_audio.weight.data)
         nn.init.xavier_uniform_(self.conv_video.weight.data)
 
@@ -290,6 +312,8 @@ class DepMamba(BaseNet):
         xa = self.conv_audio(xa.permute(0,2,1)).permute(0,2,1)
         xv = self.conv_video(xv.permute(0,2,1)).permute(0,2,1)
         xa_out, xv_out = self.cossm_encoder(xa, xv, a_inference_params, v_inference_params)
+        xa_out = self.sg_mask_a(xa_out)
+        xv_out = self.sg_mask_v(xv_out)
         b_out = self.bottleneck_fusion(xa_out, xv_out, padding_mask)
         global_feature = b_out.mean(dim=1)
         return global_feature
@@ -308,7 +332,6 @@ class DepMamba(BaseNet):
             raise RuntimeError("Silent failure detected: BottleneckFusion.forward was not executed.")
 
     def forward(self, x, padding_mask=None):
-        x = self._apply_time_masking(x, padding_mask)
         x = self.feature_extractor(x, padding_mask)
         out = self.output(x)
         return out
