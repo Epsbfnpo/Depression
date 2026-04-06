@@ -193,10 +193,11 @@ def main():
             val_loader = get_lmvd_dataloader(args.data_dir, "valid", args.batch_size, args.test_gender)
             test_loader = get_lmvd_dataloader(args.data_dir, "test", args.batch_size, args.test_gender)
             
-        loss_fn = torch.nn.CrossEntropyLoss()
+        loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
         optimizer = torch.optim.AdamW(net.parameters(), lr=args.learning_rate, weight_decay=5e-2)
-        best_val_acc = -1.0
-        best_test_acc = -1.0
+        best_val_f1 = -1.0
+        early_stop_patience = 20
+        early_stop_counter = 0
         
         if args.train:
             for epoch in range(args.epochs):
@@ -204,10 +205,16 @@ def main():
                 val_results = val(net, val_loader, loss_fn, args.device[0],args.tqdm_able)
                 print(f"[Epoch {epoch + 1}] Train metrics: {train_results}")
                 print(f"[Epoch {epoch + 1}] Valid metrics: {val_results}")
-                val_acc = (val_results["acc"] + val_results["precision"]+ val_results["recall"]+ val_results["f1"])/4.0
-                if val_acc > best_val_acc:
-                    best_val_acc = val_acc
+                current_val_f1 = val_results["f1"]
+                if current_val_f1 > best_val_f1:
+                    best_val_f1 = current_val_f1
+                    early_stop_counter = 0
                     torch.save(net.state_dict(),f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt")
+                else:
+                    early_stop_counter += 1
+                    if early_stop_counter >= early_stop_patience:
+                        print(f"[EarlyStopping] Stop at epoch {epoch + 1}; best val f1={best_val_f1:.4f}")
+                        break
                 if args.if_wandb:
                     wandb.log({
                         "loss/train": train_results["loss"],
@@ -219,7 +226,8 @@ def main():
                         "acc/val": val_results["acc"],
                         "precision/val": val_results["precision"],
                         "recall/val": val_results["recall"],
-                        "f1/val": val_results["f1"]
+                        "f1/val": val_results["f1"],
+                        "best_f1/val": best_val_f1
                     })
                     
         with torch.no_grad():
