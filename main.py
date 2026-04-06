@@ -88,6 +88,17 @@ def _assert_silent_failure_check(model_for_check):
     if hasattr(model_for_check, "assert_new_path_executed"):
         model_for_check.assert_new_path_executed()
 
+def _build_class_weighted_loss(train_loader, device):
+    labels = getattr(train_loader.dataset, "labels", None)
+    if labels is None or len(labels) == 0:
+        return torch.nn.CrossEntropyLoss(label_smoothing=0.1)
+    label_tensor = torch.tensor(labels, dtype=torch.long)
+    class_count = torch.bincount(label_tensor, minlength=2).float()
+    total = class_count.sum()
+    class_count = torch.clamp(class_count, min=1.0)
+    weights = (total / class_count) / 2.0
+    return torch.nn.CrossEntropyLoss(weight=weights.to(device), label_smoothing=0.1)
+
 def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, total_epochs, tqdm_able):
     net.train()
     sample_count = 0
@@ -193,8 +204,11 @@ def main():
             val_loader = get_lmvd_dataloader(args.data_dir, "valid", args.batch_size, args.test_gender)
             test_loader = get_lmvd_dataloader(args.data_dir, "test", args.batch_size, args.test_gender)
             
-        loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
+        loss_fn = _build_class_weighted_loss(train_loader, args.device[0])
         optimizer = torch.optim.AdamW(net.parameters(), lr=args.learning_rate, weight_decay=5e-2)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=1e-6
+        )
         best_val_f1 = -1.0
         early_stop_patience = 20
         early_stop_counter = 0
@@ -202,6 +216,7 @@ def main():
         if args.train:
             for epoch in range(args.epochs):
                 train_results = train_epoch(net, train_loader, loss_fn, optimizer, args.device[0], epoch, args.epochs, args.tqdm_able)
+                scheduler.step()
                 val_results = val(net, val_loader, loss_fn, args.device[0],args.tqdm_able)
                 print(f"[Epoch {epoch + 1}] Train metrics: {train_results}")
                 print(f"[Epoch {epoch + 1}] Valid metrics: {val_results}")

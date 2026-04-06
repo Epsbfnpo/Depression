@@ -250,7 +250,7 @@ class EnSSM(nn.Module):
         return out
 
 class DepMamba(BaseNet):
-    def __init__(self, audio_input_size=161, video_input_size=161, mm_input_size=128, mm_output_sizes=[256,64], d_ffn=1024, num_layers=8, dropout=0.1, activation='Swish', causal=False, mamba_config=None):
+    def __init__(self, audio_input_size=161, video_input_size=161, mm_input_size=128, mm_output_sizes=[256,64], d_ffn=1024, num_layers=8, dropout=0.1, activation='Swish', causal=False, mamba_config=None, time_mask_prob=0.3, time_mask_width=20):
         super(DepMamba, self).__init__()
         self.conv_audio = nn.Conv1d(audio_input_size, mm_input_size, 1, padding=0, dilation=1, bias=False)
         self.conv_video = nn.Conv1d(video_input_size, mm_input_size, 1, padding=0, dilation=1, bias=False)
@@ -279,6 +279,8 @@ class DepMamba(BaseNet):
         )
         self.sg_mask_a = SaliencyGuidedMasking(mask_ratio=0.2, prob=0.5)
         self.sg_mask_v = SaliencyGuidedMasking(mask_ratio=0.2, prob=0.5)
+        self.time_mask_prob = time_mask_prob
+        self.time_mask_width = time_mask_width
         self.feature_extractor_called = False
         nn.init.xavier_uniform_(self.conv_audio.weight.data)
         nn.init.xavier_uniform_(self.conv_video.weight.data)
@@ -307,15 +309,25 @@ class DepMamba(BaseNet):
 
     def feature_extractor(self, x, padding_mask=None, a_inference_params = None, v_inference_params = None):
         self.feature_extractor_called = True
+        x = self._apply_time_masking(x, padding_mask)
         xa = x[:, :, 136:]
         xv = x[:, :, :136]
         xa = self.conv_audio(xa.permute(0,2,1)).permute(0,2,1)
         xv = self.conv_video(xv.permute(0,2,1)).permute(0,2,1)
         xa_out, xv_out = self.cossm_encoder(xa, xv, a_inference_params, v_inference_params)
+        if padding_mask is not None:
+            valid_mask = padding_mask.unsqueeze(-1).to(xa_out.dtype)
+            xa_out = xa_out * valid_mask
+            xv_out = xv_out * valid_mask
         xa_out = self.sg_mask_a(xa_out)
         xv_out = self.sg_mask_v(xv_out)
         b_out = self.bottleneck_fusion(xa_out, xv_out, padding_mask)
-        global_feature = b_out.mean(dim=1)
+        if padding_mask is not None:
+            valid_lens = torch.clamp(padding_mask.sum(dim=1, keepdim=True), min=1).to(b_out.dtype)
+            pooled_mask = (torch.arange(b_out.size(1), device=b_out.device).unsqueeze(0) < valid_lens.long()).unsqueeze(-1).to(b_out.dtype)
+            global_feature = (b_out * pooled_mask).sum(dim=1) / valid_lens
+        else:
+            global_feature = b_out.mean(dim=1)
         return global_feature
 
     def classifier(self, x):
