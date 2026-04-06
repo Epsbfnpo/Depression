@@ -167,7 +167,12 @@ def main():
     if args.if_wandb:
         wandb_run_name = f"{args.model}-{args.train_gender}-{args.test_gender}-baseline-3seeds"
         wandb.init(project="mamnba_ad", config=args, name=wandb_run_name)
-        args = wandb.config
+    
+    if dp_device_ids is not None:
+        raise ValueError(
+            "Fatal Error: Pure asynchronous architecture with Batch=1 CANNOT be split across "
+            "multiple GPUs using DataParallel. Please set -g to a single GPU ID (e.g., -g '0')."
+        )
 
     for i_iter in range(3):
         # 3. 【新增】每次循环开头动态设置严格的种子
@@ -191,9 +196,6 @@ def main():
             raise NotImplementedError(f"The {args.model} method has not been implemented by this repo")
         net = net.to(primary_device)
         
-        if dp_device_ids is not None:
-            net = torch.nn.DataParallel(net, device_ids=dp_device_ids)
-            
         if args.dataset=='dvlog':
             train_loader = get_dvlog_dataloader(args.data_dir, "train", args.train_gender)
             val_loader = get_dvlog_dataloader(args.data_dir, "valid", args.test_gender)
@@ -205,6 +207,10 @@ def main():
             
         loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
         optimizer = torch.optim.AdamW(net.parameters(), lr=args.learning_rate, weight_decay=5e-2)
+        if getattr(args, "lr_scheduler", None) == "cos":
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+        else:
+            scheduler = None
         best_val_f1 = -1.0
         early_stop_patience = 20
         early_stop_counter = 0
@@ -225,6 +231,8 @@ def main():
                 val_results = val(net, val_loader, loss_fn, primary_device, args.tqdm_able)
                 print(f"[Epoch {epoch + 1}] Train metrics: {train_results}")
                 print(f"[Epoch {epoch + 1}] Valid metrics: {val_results}")
+                if scheduler is not None:
+                    scheduler.step()
                 current_val_f1 = val_results["f1"]
                 if current_val_f1 > best_val_f1:
                     best_val_f1 = current_val_f1
