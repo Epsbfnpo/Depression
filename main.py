@@ -60,25 +60,60 @@ def _parse_gpu_arg(gpu_arg: str):
     ids = [int(x) for x in s.split(",") if x != ""]
     return ids
 
+def _compute_binary_metrics(pred, y):
+    tp = torch.sum((pred == 1) & (y == 1)).item()
+    fp = torch.sum((pred == 1) & (y == 0)).item()
+    tn = torch.sum((pred == 0) & (y == 0)).item()
+    fn = torch.sum((pred == 0) & (y == 1)).item()
+    return tp, fp, tn, fn
+
+def _finalize_metrics(running_loss, sample_count, tp, fp, tn, fn):
+    l = running_loss / sample_count
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1_score = (2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0)
+    accuracy = ((tp + tn) / sample_count if sample_count > 0 else 0.0)
+    return {"loss": l, "acc": accuracy, "precision": precision, "recall": recall, "f1": f1_score}
+
+def _get_model_for_checks(net):
+    return net.module if isinstance(net, torch.nn.DataParallel) else net
+
+def _run_silent_failure_check(net):
+    model_for_check = _get_model_for_checks(net)
+    if hasattr(model_for_check, "reset_silent_failure_flags"):
+        model_for_check.reset_silent_failure_flags()
+    return model_for_check
+
+def _assert_silent_failure_check(model_for_check):
+    if hasattr(model_for_check, "assert_new_path_executed"):
+        model_for_check.assert_new_path_executed()
+
 def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, total_epochs, tqdm_able):
     net.train()
     sample_count = 0
     running_loss = 0.
-    correct_count = 0
+    TP, FP, TN, FN = 0, 0, 0, 0
     with tqdm(train_loader, desc=f"Training epoch {current_epoch}/{total_epochs}", leave=False, unit="batch", disable=tqdm_able) as pbar:
         for x, y, mask in pbar:
-            x, y, mask = x.to(device), y.to(device).unsqueeze(1), mask.to(device)
+            model_for_check = _run_silent_failure_check(net)
+            x, y, mask = x.to(device), y.to(device), mask.to(device)
             y_pred = net(x, mask)
-            loss = loss_fn(y_pred, y.to(torch.float32))
+            _assert_silent_failure_check(model_for_check)
+            loss = loss_fn(y_pred, y.long())
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
             sample_count += x.shape[0]
             running_loss += loss.item() * x.shape[0]
-            pred = (y_pred > 0.).int()
-            correct_count += (pred == y).sum().item()
-            pbar.set_postfix({"loss": running_loss / sample_count, "acc": correct_count / sample_count,})
-    return {"loss": running_loss / sample_count, "acc": correct_count / sample_count,}
+            pred = torch.argmax(y_pred, dim=1)
+            tp, fp, tn, fn = _compute_binary_metrics(pred, y)
+            TP += tp
+            FP += fp
+            TN += tn
+            FN += fn
+            current = _finalize_metrics(running_loss, sample_count, TP, FP, TN, FN)
+            pbar.set_postfix(current)
+    return _finalize_metrics(running_loss, sample_count, TP, FP, TN, FN)
 
 def val(net, val_loader, loss_fn, device, tqdm_able):
     net.eval()
@@ -88,28 +123,21 @@ def val(net, val_loader, loss_fn, device, tqdm_able):
     with torch.no_grad():
         with tqdm(val_loader, desc="Validating", leave=False, unit="batch", disable=tqdm_able) as pbar:
             for x, y, mask in pbar:
-                x, y, mask = x.to(device), y.to(device).unsqueeze(1), mask.to(device)
+                model_for_check = _run_silent_failure_check(net)
+                x, y, mask = x.to(device), y.to(device), mask.to(device)
                 y_pred = net(x, mask)
-                loss = loss_fn(y_pred, y.to(torch.float32))
+                _assert_silent_failure_check(model_for_check)
+                loss = loss_fn(y_pred, y.long())
                 sample_count += x.shape[0]
                 running_loss += loss.item() * x.shape[0]
-                pred = (y_pred > 0.).int()
-                TP += torch.sum((pred == 1) & (y == 1)).item()
-                FP += torch.sum((pred == 1) & (y == 0)).item()
-                TN += torch.sum((pred == 0) & (y == 0)).item()
-                FN += torch.sum((pred == 0) & (y == 1)).item()
-                l = running_loss / sample_count
-                precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
-                recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
-                f1_score = (2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0)
-                accuracy = ((TP + TN) / sample_count if sample_count > 0 else 0.0)
-                pbar.set_postfix({"loss": l, "acc": accuracy, "precision": precision, "recall": recall, "f1": f1_score,})
-    l = running_loss / sample_count
-    precision = TP / (TP + FP) if (TP + FP) > 0 else 0.0
-    recall = TP / (TP + FN) if (TP + FN) > 0 else 0.0
-    f1_score = (2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0)
-    accuracy = ((TP + TN) / sample_count if sample_count > 0 else 0.0)
-    return {"loss": l, "acc": accuracy, "precision": precision, "recall": recall, "f1": f1_score,}
+                pred = torch.argmax(y_pred, dim=1)
+                tp, fp, tn, fn = _compute_binary_metrics(pred, y)
+                TP += tp
+                FP += fp
+                TN += tn
+                FN += fn
+                pbar.set_postfix(_finalize_metrics(running_loss, sample_count, TP, FP, TN, FN))
+    return _finalize_metrics(running_loss, sample_count, TP, FP, TN, FN)
 
 def main():
     # 1. 删除了原先在这里的 seed_everything(seed=42)
@@ -165,8 +193,8 @@ def main():
             val_loader = get_lmvd_dataloader(args.data_dir, "valid", args.batch_size, args.test_gender)
             test_loader = get_lmvd_dataloader(args.data_dir, "test", args.batch_size, args.test_gender)
             
-        loss_fn = torch.nn.BCEWithLogitsLoss()
-        optimizer = torch.optim.Adam(net.parameters(), lr=args.learning_rate)
+        loss_fn = torch.nn.CrossEntropyLoss()
+        optimizer = torch.optim.AdamW(net.parameters(), lr=args.learning_rate, weight_decay=5e-2)
         best_val_acc = -1.0
         best_test_acc = -1.0
         
@@ -174,12 +202,25 @@ def main():
             for epoch in range(args.epochs):
                 train_results = train_epoch(net, train_loader, loss_fn, optimizer, args.device[0], epoch, args.epochs, args.tqdm_able)
                 val_results = val(net, val_loader, loss_fn, args.device[0],args.tqdm_able)
+                print(f"[Epoch {epoch + 1}] Train metrics: {train_results}")
+                print(f"[Epoch {epoch + 1}] Valid metrics: {val_results}")
                 val_acc = (val_results["acc"] + val_results["precision"]+ val_results["recall"]+ val_results["f1"])/4.0
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
                     torch.save(net.state_dict(),f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt")
                 if args.if_wandb:
-                    wandb.log({"loss/train": train_results["loss"], "acc/train": train_results["acc"], "loss/val": val_results["loss"], "acc/val": val_results["acc"], "precision/val": val_results["precision"], "recall/val": val_results["recall"], "f1/val": val_results["f1"]})
+                    wandb.log({
+                        "loss/train": train_results["loss"],
+                        "acc/train": train_results["acc"],
+                        "precision/train": train_results["precision"],
+                        "recall/train": train_results["recall"],
+                        "f1/train": train_results["f1"],
+                        "loss/val": val_results["loss"],
+                        "acc/val": val_results["acc"],
+                        "precision/val": val_results["precision"],
+                        "recall/val": val_results["recall"],
+                        "f1/val": val_results["f1"]
+                    })
                     
         with torch.no_grad():
             net.load_state_dict(torch.load(f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt", map_location=args.device[0]))
