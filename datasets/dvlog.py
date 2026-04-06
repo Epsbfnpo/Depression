@@ -1,49 +1,49 @@
 from pathlib import Path
-from typing import Union, Optional
-import torch
-from torch.utils import data
-from torch.nn.utils.rnn import pad_sequence
-import numpy as np
+from typing import Union
 import random
 
+import numpy as np
+import torch
+from torch.utils import data
+
+
 class DVlog(data.Dataset):
-    def __init__(self, root: Union[str, Path], fold: str="train", gender: str="both", transform=None, target_transform=None, aug=False):
+    def __init__(self, root: Union[str, Path], fold: str = "train", gender: str = "both", transform=None, target_transform=None, aug: bool = False):
         self.root = root if isinstance(root, Path) else Path(root)
         self.fold = fold
         self.gender = gender
         self.transform = transform
         self.target_transform = target_transform
         self.aug = aug
-        self.features = []
+
+        self.v_features = []
+        self.a_features = []
         self.labels = []
+
         with open(self.root / "labels.csv", "r") as f:
             for line in f:
                 sample = line.strip().split(",")
-                if self.is_sample(sample):
-                    s_id = sample[0]
-                    s_label = int(sample[1]=="depression")
-                    self.labels.append(s_label)
-                    v_feature_path = self.root / s_id / f"{s_id}_visual.npy"
-                    a_feature_path = self.root / s_id / f"{s_id}_acoustic.npy"
-                    v_feature = np.load(v_feature_path)
-                    a_feature = np.load(a_feature_path)
-                    T_v, T_a = v_feature.shape[0], a_feature.shape[0]
-                    if T_v == T_a:
-                        feature = np.concatenate((v_feature, a_feature), axis=1).astype(np.float32)
-                    else:
-                        T = min(T_v, T_a)
-                        feature = np.concatenate((v_feature[:T], a_feature[:T]), axis=1).astype(np.float32)
-                    self.features.append(feature)
-                    if self.aug and self.fold=='train':
-                        t_length = feature.shape[0]
-                        for i in range(5):
-                            f_length = int(random.random()*t_length)
-                            if f_length<500:
-                                continue
-                            t_start = random.randint(1, t_length-f_length)
+                if not self.is_sample(sample):
+                    continue
+
+                s_id = sample[0]
+                s_label = int(sample[1] == "depression")
+                v_feature_path = self.root / s_id / f"{s_id}_visual.npy"
+                a_feature_path = self.root / s_id / f"{s_id}_acoustic.npy"
+
+                self.v_features.append(v_feature_path)
+                self.a_features.append(a_feature_path)
+                self.labels.append(s_label)
+
+                if self.aug and self.fold == "train":
+                    # 仅复制样本索引，不做对齐/拼接截断
+                    for _ in range(5):
+                        if random.random() > 0.5:
+                            self.v_features.append(v_feature_path)
+                            self.a_features.append(a_feature_path)
                             self.labels.append(s_label)
-                            self.features.append(feature[t_start:t_start+f_length,:])
-        print(f"ALL:{len(self.labels)}, Positive:{np.sum(self.labels)}, Negative:{len(self.labels)-np.sum(self.labels)}")
+
+        print(f"ALL:{len(self.labels)}, Positive:{np.sum(self.labels)}, Negative:{len(self.labels) - np.sum(self.labels)}")
 
     def is_sample(self, sample) -> bool:
         gender, fold = sample[3], sample[4]
@@ -52,41 +52,27 @@ class DVlog(data.Dataset):
         return (fold == self.fold) and (gender == self.gender)
 
     def __getitem__(self, i: int):
-        feature = self.features[i]
+        v_feature = np.load(self.v_features[i])
+        a_feature = np.load(self.a_features[i])
         label = self.labels[i]
+
+        v_tensor = torch.tensor(v_feature, dtype=torch.float32)
+        a_tensor = torch.tensor(a_feature, dtype=torch.float32)
+        label_tensor = torch.tensor(label, dtype=torch.long)
+
         if self.transform is not None:
-            print("Transform 1")
-            feature = self.transform(feature)
+            v_tensor = self.transform(v_tensor)
+            a_tensor = self.transform(a_tensor)
         if self.target_transform is not None:
-            print("Transform 2")
-            label = self.target_transform(label)
-        return feature, label
+            label_tensor = self.target_transform(label_tensor)
+
+        return {"video": v_tensor, "audio": a_tensor, "label": label_tensor}
 
     def __len__(self):
         return len(self.labels)
 
-def _collate_fn(batch):
-    features, labels = zip(*batch)
-    padded_features = pad_sequence([torch.from_numpy(f) for f in features], batch_first=True)
-    padding_mask = (padded_features.sum(dim=-1) != 0).long()
-    labels = torch.tensor(labels)
-    return padded_features, labels, padding_mask
 
-def get_dvlog_dataloader(root: Union[str, Path], fold: str="train", batch_size: int=8, gender: str="both", transform=None, target_transform=None, aug=True):
+def get_dvlog_dataloader(root: Union[str, Path], fold: str = "train", gender: str = "both", transform=None, target_transform=None, aug: bool = True):
     dataset = DVlog(root, fold, gender, transform, target_transform, aug)
-    dataloader = data.DataLoader(dataset, batch_size=batch_size, collate_fn=_collate_fn, shuffle=(fold=="train"),)
+    dataloader = data.DataLoader(dataset, batch_size=1, shuffle=(fold == "train"), drop_last=False)
     return dataloader
-
-if __name__ == '__main__':
-    train_loader = get_dvlog_dataloader(root="./dataset/dvlog", fold="train")
-    print(f"train_loader: {len(train_loader.dataset)} samples")
-    valid_loader = get_dvlog_dataloader(root="./dataset/dvlog", fold="valid")
-    print(f"valid_loader: {len(valid_loader.dataset)} samples")
-    test_loader = get_dvlog_dataloader(root="./dataset/dvlog", fold="test")
-    print(f"test_loader: {len(test_loader.dataset)} samples")
-    b1 = next(iter(train_loader))[0]
-    print(f"A train_loader batch: shape={b1.shape}, dtype={b1.dtype}")
-    b2 = next(iter(valid_loader))[0]
-    print(f"A valid_loader batch: shape={b2.shape}, dtype={b2.dtype}")
-    b3 = next(iter(test_loader))[0]
-    print(f"A test_loader batch: shape={b3.shape}, dtype={b3.dtype}")
