@@ -90,6 +90,7 @@ def _assert_silent_failure_check(model_for_check):
 
 def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, total_epochs, tqdm_able, accumulation_steps=16):
     net.train()
+    accumulation_steps = max(1, int(accumulation_steps))
     sample_count = 0
     running_loss = 0.
     TP, FP, TN, FN = 0, 0, 0, 0
@@ -194,13 +195,13 @@ def main():
             net = torch.nn.DataParallel(net, device_ids=dp_device_ids)
             
         if args.dataset=='dvlog':
-            train_loader = get_dvlog_dataloader(args.data_dir, "train", 1, args.train_gender)
-            val_loader = get_dvlog_dataloader(args.data_dir, "valid", 1, args.test_gender)
-            test_loader = get_dvlog_dataloader(args.data_dir, "test", 1, args.test_gender)
+            train_loader = get_dvlog_dataloader(args.data_dir, "train", args.train_gender)
+            val_loader = get_dvlog_dataloader(args.data_dir, "valid", args.test_gender)
+            test_loader = get_dvlog_dataloader(args.data_dir, "test", args.test_gender)
         elif args.dataset=='lmvd':
-            train_loader = get_lmvd_dataloader(args.data_dir, "train", 1, args.train_gender)
-            val_loader = get_lmvd_dataloader(args.data_dir, "valid", 1, args.test_gender)
-            test_loader = get_lmvd_dataloader(args.data_dir, "test", 1, args.test_gender)
+            train_loader = get_lmvd_dataloader(args.data_dir, "train", args.train_gender)
+            val_loader = get_lmvd_dataloader(args.data_dir, "valid", args.test_gender)
+            test_loader = get_lmvd_dataloader(args.data_dir, "test", args.test_gender)
             
         loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
         optimizer = torch.optim.AdamW(net.parameters(), lr=args.learning_rate, weight_decay=5e-2)
@@ -210,7 +211,17 @@ def main():
         
         if args.train:
             for epoch in range(args.epochs):
-                train_results = train_epoch(net, train_loader, loss_fn, optimizer, primary_device, epoch, args.epochs, args.tqdm_able)
+                train_results = train_epoch(
+                    net,
+                    train_loader,
+                    loss_fn,
+                    optimizer,
+                    primary_device,
+                    epoch,
+                    args.epochs,
+                    args.tqdm_able,
+                    accumulation_steps=args.batch_size,
+                )
                 val_results = val(net, val_loader, loss_fn, primary_device, args.tqdm_able)
                 print(f"[Epoch {epoch + 1}] Train metrics: {train_results}")
                 print(f"[Epoch {epoch + 1}] Valid metrics: {val_results}")

@@ -99,6 +99,7 @@ class DepMamba(BaseNet):
         mm_input_size=128,
         num_layers=3,
         num_bottlenecks=4,
+        nhead=8,
         num_classes=2,
         mamba_config=None,
         **kwargs,
@@ -140,7 +141,14 @@ class DepMamba(BaseNet):
         )
 
         self.bottleneck_blocks = nn.ModuleList(
-            [TrueBottleneckBlock(mm_input_size, num_bottlenecks=num_bottlenecks) for _ in range(num_layers)]
+            [
+                TrueBottleneckBlock(
+                    mm_input_size,
+                    num_bottlenecks=num_bottlenecks,
+                    nhead=nhead,
+                )
+                for _ in range(num_layers)
+            ]
         )
 
         self.output = nn.Sequential(

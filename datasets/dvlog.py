@@ -72,7 +72,7 @@ class DVlog(data.Dataset):
         return len(self.labels)
 
 
-def get_dvlog_dataloader(root: Union[str, Path], fold: str = "train", batch_size: int = 1, gender: str = "both", transform=None, target_transform=None, aug: bool = True):
+def get_dvlog_dataloader(root: Union[str, Path], fold: str = "train", gender: str = "both", transform=None, target_transform=None, aug: bool = True):
     dataset = DVlog(root, fold, gender, transform, target_transform, aug)
     dataloader = data.DataLoader(dataset, batch_size=1, shuffle=(fold == "train"), drop_last=False)
     return dataloader
