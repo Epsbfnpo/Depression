@@ -150,7 +150,6 @@ def val(net, val_loader, loss_fn, device, tqdm_able):
     return _finalize_metrics(running_loss, sample_count, TP, FP, TN, FN)
 
 def main():
-    # 1. 删除了原先在这里的 seed_everything(seed=42)
     args = parse_args()
     gpu_ids = _parse_gpu_arg(args.gpu)
     if gpu_ids is None or not torch.cuda.is_available():
@@ -161,16 +160,20 @@ def main():
         primary_device = torch.device(f"cuda:{gpu_ids[0]}")
         dp_device_ids = gpu_ids if len(gpu_ids) > 1 else None
     print(f"[Device] primary={primary_device}, data_parallel_ids={dp_device_ids}")
-    args.data_dir = os.path.join(args.data_dir,args.dataset)
 
-    # 2. 【新增】将 WandB 初始化移到循环外，并加上 '-3seeds' 后缀
+    if dp_device_ids is not None:
+        raise ValueError(
+            "Fatal Error: Pure asynchronous architecture with Batch=1 CANNOT be split across "
+            "multiple GPUs using DataParallel. Please set -g to a single GPU ID (e.g., -g '0')."
+        )
+
+    args.data_dir = os.path.join(args.data_dir, args.dataset)
+
     if args.if_wandb:
         wandb_run_name = f"{args.model}-{args.train_gender}-{args.test_gender}-baseline-3seeds"
         wandb.init(project="mamnba_ad", config=args, name=wandb_run_name)
-        args = wandb.config
 
     for i_iter in range(3):
-        # 3. 【新增】每次循环开头动态设置严格的种子
         current_seed = 42 + i_iter
         seed_everything(seed=current_seed)
         print(f"\n=======================================================")
@@ -191,9 +194,6 @@ def main():
             raise NotImplementedError(f"The {args.model} method has not been implemented by this repo")
         net = net.to(primary_device)
         
-        if dp_device_ids is not None:
-            net = torch.nn.DataParallel(net, device_ids=dp_device_ids)
-            
         if args.dataset=='dvlog':
             train_loader = get_dvlog_dataloader(args.data_dir, "train", args.train_gender)
             val_loader = get_dvlog_dataloader(args.data_dir, "valid", args.test_gender)
@@ -204,7 +204,27 @@ def main():
             test_loader = get_lmvd_dataloader(args.data_dir, "test", args.test_gender)
             
         loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
-        optimizer = torch.optim.AdamW(net.parameters(), lr=args.learning_rate, weight_decay=5e-2)
+        decay_params = []
+        no_decay_params = []
+        for name, param in net.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            if param.ndim <= 1 or "bias" in name or "norm" in name or "latent_pe" in name:
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
+        optim_groups = [
+            {"params": decay_params, "weight_decay": 1e-1},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
+
+        optimizer = torch.optim.AdamW(optim_groups, lr=args.learning_rate)
+        if getattr(args, "lr_scheduler", None) == "cos":
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+        else:
+            scheduler = None
         best_val_f1 = -1.0
         early_stop_patience = 20
         early_stop_counter = 0
@@ -225,6 +245,8 @@ def main():
                 val_results = val(net, val_loader, loss_fn, primary_device, args.tqdm_able)
                 print(f"[Epoch {epoch + 1}] Train metrics: {train_results}")
                 print(f"[Epoch {epoch + 1}] Valid metrics: {val_results}")
+                if scheduler is not None:
+                    scheduler.step()
                 current_val_f1 = val_results["f1"]
                 if current_val_f1 > best_val_f1:
                     best_val_f1 = current_val_f1
