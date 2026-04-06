@@ -88,23 +88,30 @@ def _assert_silent_failure_check(model_for_check):
     if hasattr(model_for_check, "assert_new_path_executed"):
         model_for_check.assert_new_path_executed()
 
-def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, total_epochs, tqdm_able):
+def train_epoch(net, train_loader, loss_fn, optimizer, device, current_epoch, total_epochs, tqdm_able, accumulation_steps=16):
     net.train()
     sample_count = 0
     running_loss = 0.
     TP, FP, TN, FN = 0, 0, 0, 0
+    optimizer.zero_grad()
     with tqdm(train_loader, desc=f"Training epoch {current_epoch}/{total_epochs}", leave=False, unit="batch", disable=tqdm_able) as pbar:
-        for x, y, mask in pbar:
+        for i, batch in enumerate(pbar):
             model_for_check = _run_silent_failure_check(net)
-            x, y, mask = x.to(device), y.to(device), mask.to(device)
-            y_pred = net(x, mask)
+            videos = batch["video"].to(device)
+            audios = batch["audio"].to(device)
+            y = batch["label"].to(device)
+            y_pred = net(audios, videos)
             _assert_silent_failure_check(model_for_check)
             loss = loss_fn(y_pred, y.long())
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
-            sample_count += x.shape[0]
-            running_loss += loss.item() * x.shape[0]
+            (loss / accumulation_steps).backward()
+
+            if (i + 1) % accumulation_steps == 0 or (i + 1) == len(train_loader):
+                torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+
+            sample_count += videos.shape[0]
+            running_loss += loss.item() * videos.shape[0]
             pred = torch.argmax(y_pred, dim=1)
             tp, fp, tn, fn = _compute_binary_metrics(pred, y)
             TP += tp
@@ -122,14 +129,16 @@ def val(net, val_loader, loss_fn, device, tqdm_able):
     TP, FP, TN, FN = 0, 0, 0, 0
     with torch.no_grad():
         with tqdm(val_loader, desc="Validating", leave=False, unit="batch", disable=tqdm_able) as pbar:
-            for x, y, mask in pbar:
+            for batch in pbar:
                 model_for_check = _run_silent_failure_check(net)
-                x, y, mask = x.to(device), y.to(device), mask.to(device)
-                y_pred = net(x, mask)
+                videos = batch["video"].to(device)
+                audios = batch["audio"].to(device)
+                y = batch["label"].to(device)
+                y_pred = net(audios, videos)
                 _assert_silent_failure_check(model_for_check)
                 loss = loss_fn(y_pred, y.long())
-                sample_count += x.shape[0]
-                running_loss += loss.item() * x.shape[0]
+                sample_count += videos.shape[0]
+                running_loss += loss.item() * videos.shape[0]
                 pred = torch.argmax(y_pred, dim=1)
                 tp, fp, tn, fn = _compute_binary_metrics(pred, y)
                 TP += tp
@@ -179,19 +188,19 @@ def main():
                 net = DepMamba(**args.mmmamba)
         else:
             raise NotImplementedError(f"The {args.model} method has not been implemented by this repo")
-        net = net.to(args.device[0])
+        net = net.to(primary_device)
         
-        if len(args.device) > 1:
-            net = torch.nn.DataParallel(net, device_ids=args.device)
+        if dp_device_ids is not None:
+            net = torch.nn.DataParallel(net, device_ids=dp_device_ids)
             
         if args.dataset=='dvlog':
-            train_loader = get_dvlog_dataloader(args.data_dir, "train", args.batch_size, args.train_gender)
-            val_loader = get_dvlog_dataloader(args.data_dir, "valid", args.batch_size, args.test_gender)
-            test_loader = get_dvlog_dataloader(args.data_dir, "test", args.batch_size, args.test_gender)
+            train_loader = get_dvlog_dataloader(args.data_dir, "train", 1, args.train_gender)
+            val_loader = get_dvlog_dataloader(args.data_dir, "valid", 1, args.test_gender)
+            test_loader = get_dvlog_dataloader(args.data_dir, "test", 1, args.test_gender)
         elif args.dataset=='lmvd':
-            train_loader = get_lmvd_dataloader(args.data_dir, "train", args.batch_size, args.train_gender)
-            val_loader = get_lmvd_dataloader(args.data_dir, "valid", args.batch_size, args.test_gender)
-            test_loader = get_lmvd_dataloader(args.data_dir, "test", args.batch_size, args.test_gender)
+            train_loader = get_lmvd_dataloader(args.data_dir, "train", 1, args.train_gender)
+            val_loader = get_lmvd_dataloader(args.data_dir, "valid", 1, args.test_gender)
+            test_loader = get_lmvd_dataloader(args.data_dir, "test", 1, args.test_gender)
             
         loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
         optimizer = torch.optim.AdamW(net.parameters(), lr=args.learning_rate, weight_decay=5e-2)
@@ -201,8 +210,8 @@ def main():
         
         if args.train:
             for epoch in range(args.epochs):
-                train_results = train_epoch(net, train_loader, loss_fn, optimizer, args.device[0], epoch, args.epochs, args.tqdm_able)
-                val_results = val(net, val_loader, loss_fn, args.device[0],args.tqdm_able)
+                train_results = train_epoch(net, train_loader, loss_fn, optimizer, primary_device, epoch, args.epochs, args.tqdm_able)
+                val_results = val(net, val_loader, loss_fn, primary_device, args.tqdm_able)
                 print(f"[Epoch {epoch + 1}] Train metrics: {train_results}")
                 print(f"[Epoch {epoch + 1}] Valid metrics: {val_results}")
                 current_val_f1 = val_results["f1"]
@@ -231,9 +240,9 @@ def main():
                     })
                     
         with torch.no_grad():
-            net.load_state_dict(torch.load(f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt", map_location=args.device[0]))
+            net.load_state_dict(torch.load(f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt", map_location=primary_device))
             net.eval()
-            test_results = val(net, test_loader, loss_fn, args.device[0],args.tqdm_able)
+            test_results = val(net, test_loader, loss_fn, primary_device, args.tqdm_able)
             print("Test results:")
             print(test_results)
             os.makedirs("./results", exist_ok=True)
