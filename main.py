@@ -194,7 +194,7 @@ def main():
             test_loader = get_lmvd_dataloader(args.data_dir, "test", args.batch_size, args.test_gender)
             
         loss_fn = torch.nn.CrossEntropyLoss()
-        optimizer = torch.optim.AdamW(net.parameters(), lr=args.learning_rate, weight_decay=1e-2)
+        optimizer = torch.optim.AdamW(net.parameters(), lr=args.learning_rate, weight_decay=5e-2)
         best_val_acc = -1.0
         best_test_acc = -1.0
         

@@ -18,8 +18,8 @@ device:
 mmmamba:
   audio_input_size: 25 # LDDs for D-Vlog
   video_input_size: 136
-  mm_input_size: 256
-  mm_output_sizes: [256]
+  mm_input_size: 128
+  mm_output_sizes: [128]
   dropout: 0.4
   d_ffn: 1024 
   num_layers: 4
@@ -35,8 +35,8 @@ mmmamba:
 mmmamba_lmvd:
   audio_input_size: 128 # VGGish for LMVD
   video_input_size: 136
-  mm_input_size: 256
-  mm_output_sizes: [256]
+  mm_input_size: 128
+  mm_output_sizes: [128]
   dropout: 0.4
   d_ffn: 1024 
   num_layers: 4

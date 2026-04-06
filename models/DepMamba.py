@@ -244,7 +244,7 @@ class DepMamba(BaseNet):
         )
         self.bottleneck_fusion = BottleneckFusion(
             d_model=mm_input_size,
-            num_bottlenecks=4,
+            num_bottlenecks=2,
             nhead=4,
             dropout=max(dropout, 0.3)
         )
@@ -256,8 +256,32 @@ class DepMamba(BaseNet):
             nn.Linear(mm_input_size // 2, 2)
         )
         self.feature_extractor_called = False
+        self.time_mask_prob = 0.3
+        self.time_mask_width = 50
         nn.init.xavier_uniform_(self.conv_audio.weight.data)
         nn.init.xavier_uniform_(self.conv_video.weight.data)
+
+    def _apply_time_masking(self, x, padding_mask=None):
+        if (not self.training) or (self.time_mask_prob <= 0):
+            return x
+        b_size, seq_len, _ = x.shape
+        mask_len = min(self.time_mask_width, seq_len)
+        if mask_len <= 0:
+            return x
+        aug_x = x.clone()
+        for b in range(b_size):
+            if torch.rand(1, device=x.device).item() >= self.time_mask_prob:
+                continue
+            valid_len = seq_len
+            if padding_mask is not None:
+                valid_len = int(padding_mask[b].sum().item())
+            if valid_len <= 1:
+                continue
+            current_len = min(mask_len, valid_len)
+            max_start = max(valid_len - current_len, 0)
+            start = 0 if max_start == 0 else torch.randint(0, max_start + 1, (1,), device=x.device).item()
+            aug_x[b, start:start + current_len, :] = 0.0
+        return aug_x
 
     def feature_extractor(self, x, padding_mask=None, a_inference_params = None, v_inference_params = None):
         self.feature_extractor_called = True
@@ -284,6 +308,7 @@ class DepMamba(BaseNet):
             raise RuntimeError("Silent failure detected: BottleneckFusion.forward was not executed.")
 
     def forward(self, x, padding_mask=None):
+        x = self._apply_time_masking(x, padding_mask)
         x = self.feature_extractor(x, padding_mask)
         out = self.output(x)
         return out
