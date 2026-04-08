@@ -1,13 +1,14 @@
 import argparse
 import random
 import os
+import copy
 import numpy as np
 import yaml
 import wandb
 import torch
 from tqdm import tqdm
 from models import DepMamba
-from datasets import get_dvlog_dataloader, get_lmvd_dataloader
+from datasets import get_dvlog_dataloader, get_dvlog_kfold_loaders, get_lmvd_dataloader
 
 CONFIG_PATH = "./config/config.yaml"
 
@@ -193,84 +194,151 @@ def main():
         else:
             raise NotImplementedError(f"The {args.model} method has not been implemented by this repo")
         net = net.to(primary_device)
+
+        print("[INFO] Freezing low-level projection layers to prevent early overfitting.")
+        for param in net.proj_a.parameters():
+            param.requires_grad = False
+        for param in net.proj_v.parameters():
+            param.requires_grad = False
         
-        if args.dataset=='dvlog':
-            train_loader = get_dvlog_dataloader(args.data_dir, "train", args.train_gender)
-            val_loader = get_dvlog_dataloader(args.data_dir, "valid", args.test_gender)
+        if args.dataset == 'dvlog':
+            kfold_loaders = get_dvlog_kfold_loaders(
+                args.data_dir,
+                gender=args.train_gender,
+                n_splits=5,
+                random_state=current_seed,
+            )
             test_loader = get_dvlog_dataloader(args.data_dir, "test", args.test_gender)
-        elif args.dataset=='lmvd':
+        elif args.dataset == 'lmvd':
             train_loader = get_lmvd_dataloader(args.data_dir, "train", args.train_gender)
             val_loader = get_lmvd_dataloader(args.data_dir, "valid", args.test_gender)
             test_loader = get_lmvd_dataloader(args.data_dir, "test", args.test_gender)
             
         loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
-        decay_params = []
-        no_decay_params = []
-        for name, param in net.named_parameters():
-            if not param.requires_grad:
-                continue
+        initial_state_dict = copy.deepcopy(net.state_dict())
 
-            if param.ndim <= 1 or "bias" in name or "norm" in name or "latent_pe" in name:
-                no_decay_params.append(param)
-            else:
-                decay_params.append(param)
-
-        optim_groups = [
-            {"params": decay_params, "weight_decay": 1e-1},
-            {"params": no_decay_params, "weight_decay": 0.0},
-        ]
-
-        optimizer = torch.optim.AdamW(optim_groups, lr=args.learning_rate)
-        if getattr(args, "lr_scheduler", None) == "cos":
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-        else:
-            scheduler = None
-        best_val_f1 = -1.0
-        early_stop_patience = 20
-        early_stop_counter = 0
+        def build_optimizer_and_scheduler():
+            decay_params = []
+            no_decay_params = []
+            for name, param in net.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if param.ndim <= 1 or "bias" in name or "norm" in name or "latent_pe" in name:
+                    no_decay_params.append(param)
+                else:
+                    decay_params.append(param)
+            optim_groups = [
+                {"params": decay_params, "weight_decay": 1e-1},
+                {"params": no_decay_params, "weight_decay": 0.0},
+            ]
+            optimizer = torch.optim.AdamW(optim_groups, lr=args.learning_rate)
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode='min',
+                factor=0.5,
+                patience=3,
+                verbose=True
+            )
+            return optimizer, scheduler
         
         if args.train:
-            for epoch in range(args.epochs):
-                train_results = train_epoch(
-                    net,
-                    train_loader,
-                    loss_fn,
-                    optimizer,
-                    primary_device,
-                    epoch,
-                    args.epochs,
-                    args.tqdm_able,
-                    accumulation_steps=args.batch_size,
-                )
-                val_results = val(net, val_loader, loss_fn, primary_device, args.tqdm_able)
-                print(f"[Epoch {epoch + 1}] Train metrics: {train_results}")
-                print(f"[Epoch {epoch + 1}] Valid metrics: {val_results}")
-                if scheduler is not None:
-                    scheduler.step()
-                current_val_f1 = val_results["f1"]
-                if current_val_f1 > best_val_f1:
-                    best_val_f1 = current_val_f1
+            if args.dataset == "dvlog":
+                for fold_idx, (train_loader, val_loader) in enumerate(kfold_loaders):
+                    print(f"[CV] Starting fold {fold_idx + 1}/5")
+                    net.load_state_dict(initial_state_dict)
+                    optimizer, scheduler = build_optimizer_and_scheduler()
+                    best_val_loss = float('inf')
+                    early_stop_patience = 10
                     early_stop_counter = 0
-                    torch.save(net.state_dict(),f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt")
-                else:
-                    early_stop_counter += 1
-                    if early_stop_counter >= early_stop_patience:
-                        print(f"[EarlyStopping] Stop at epoch {epoch + 1}; best val f1={best_val_f1:.4f}")
-                        break
-                if args.if_wandb:
-                    wandb.log({
-                        "loss/train": train_results["loss"],
-                        "acc/train": train_results["acc"],
-                        "precision/train": train_results["precision"],
-                        "recall/train": train_results["recall"],
-                        "f1/train": train_results["f1"],
-                        "loss/val": val_results["loss"],
-                        "acc/val": val_results["acc"],
-                        "precision/val": val_results["precision"],
-                        "recall/val": val_results["recall"],
-                        "f1/val": val_results["f1"],
-                        "best_f1/val": best_val_f1
-                    })
+                    for epoch in range(args.epochs):
+                        train_results = train_epoch(
+                            net,
+                            train_loader,
+                            loss_fn,
+                            optimizer,
+                            primary_device,
+                            epoch,
+                            args.epochs,
+                            args.tqdm_able,
+                            accumulation_steps=args.batch_size,
+                        )
+                        val_results = val(net, val_loader, loss_fn, primary_device, args.tqdm_able)
+                        print(f"[Fold {fold_idx + 1} | Epoch {epoch + 1}] Train metrics: {train_results}")
+                        print(f"[Fold {fold_idx + 1} | Epoch {epoch + 1}] Valid metrics: {val_results}")
+                        current_val_loss = val_results["loss"]
+                        if scheduler is not None:
+                            scheduler.step(current_val_loss)
+                        if current_val_loss < best_val_loss:
+                            best_val_loss = current_val_loss
+                            early_stop_counter = 0
+                            torch.save(net.state_dict(), f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt")
+                            print(f"--> [Checkpoint] New best val loss: {best_val_loss:.4f} saved.")
+                        else:
+                            early_stop_counter += 1
+                            if early_stop_counter >= early_stop_patience:
+                                print(f"[EarlyStopping] Stop at epoch {epoch + 1}; best val loss={best_val_loss:.4f}")
+                                break
+                        if args.if_wandb:
+                            wandb.log({
+                                f"fold_{fold_idx + 1}/loss/train": train_results["loss"],
+                                f"fold_{fold_idx + 1}/acc/train": train_results["acc"],
+                                f"fold_{fold_idx + 1}/precision/train": train_results["precision"],
+                                f"fold_{fold_idx + 1}/recall/train": train_results["recall"],
+                                f"fold_{fold_idx + 1}/f1/train": train_results["f1"],
+                                f"fold_{fold_idx + 1}/loss/val": val_results["loss"],
+                                f"fold_{fold_idx + 1}/acc/val": val_results["acc"],
+                                f"fold_{fold_idx + 1}/precision/val": val_results["precision"],
+                                f"fold_{fold_idx + 1}/recall/val": val_results["recall"],
+                                f"fold_{fold_idx + 1}/f1/val": val_results["f1"],
+                                f"fold_{fold_idx + 1}/best_loss/val": best_val_loss
+                            })
+            else:
+                optimizer, scheduler = build_optimizer_and_scheduler()
+                best_val_loss = float('inf')
+                early_stop_patience = 10
+                early_stop_counter = 0
+                for epoch in range(args.epochs):
+                    train_results = train_epoch(
+                        net,
+                        train_loader,
+                        loss_fn,
+                        optimizer,
+                        primary_device,
+                        epoch,
+                        args.epochs,
+                        args.tqdm_able,
+                        accumulation_steps=args.batch_size,
+                    )
+                    val_results = val(net, val_loader, loss_fn, primary_device, args.tqdm_able)
+                    print(f"[Epoch {epoch + 1}] Train metrics: {train_results}")
+                    print(f"[Epoch {epoch + 1}] Valid metrics: {val_results}")
+                    current_val_loss = val_results["loss"]
+                    if scheduler is not None:
+                        scheduler.step(current_val_loss)
+                    if current_val_loss < best_val_loss:
+                        best_val_loss = current_val_loss
+                        early_stop_counter = 0
+                        torch.save(net.state_dict(), f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt")
+                        print(f"--> [Checkpoint] New best val loss: {best_val_loss:.4f} saved.")
+                    else:
+                        early_stop_counter += 1
+                        if early_stop_counter >= early_stop_patience:
+                            print(f"[EarlyStopping] Stop at epoch {epoch + 1}; best val loss={best_val_loss:.4f}")
+                            break
+                    if args.if_wandb:
+                        wandb.log({
+                            "loss/train": train_results["loss"],
+                            "acc/train": train_results["acc"],
+                            "precision/train": train_results["precision"],
+                            "recall/train": train_results["recall"],
+                            "f1/train": train_results["f1"],
+                            "loss/val": val_results["loss"],
+                            "acc/val": val_results["acc"],
+                            "precision/val": val_results["precision"],
+                            "recall/val": val_results["recall"],
+                            "f1/val": val_results["f1"],
+                            "best_loss/val": best_val_loss
+                        })
                     
         with torch.no_grad():
             net.load_state_dict(torch.load(f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt", map_location=primary_device))

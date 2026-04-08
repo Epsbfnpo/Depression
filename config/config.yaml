@@ -21,10 +21,10 @@ mmmamba:
   mm_input_size: 128
   mm_output_sizes: [128]
   dropout: 0.3
-  d_ffn: 1024 
-  num_layers: 4
+  d_ffn: 128
+  num_layers: 1
   num_bottlenecks: 2
-  nhead: 4
+  nhead: 2
   activation: 'GELU'
   causal: false
 
@@ -40,10 +40,10 @@ mmmamba_lmvd:
   mm_input_size: 128
   mm_output_sizes: [128]
   dropout: 0.3
-  d_ffn: 1024 
-  num_layers: 4
+  d_ffn: 128
+  num_layers: 1
   num_bottlenecks: 2
-  nhead: 4
+  nhead: 2
   activation: 'GELU'
   causal: false
 
