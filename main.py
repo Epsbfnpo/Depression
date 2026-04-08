@@ -271,7 +271,8 @@ def main():
                         if current_val_loss < best_val_loss:
                             best_val_loss = current_val_loss
                             early_stop_counter = 0
-                            torch.save(net.state_dict(), f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt")
+                            save_path = f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model_fold_{fold_idx}.pt"
+                            torch.save(net.state_dict(), save_path)
                             print(f"--> [Checkpoint] New best val loss: {best_val_loss:.4f} saved.")
                         else:
                             early_stop_counter += 1
@@ -341,21 +342,46 @@ def main():
                         })
                     
         with torch.no_grad():
-            net.load_state_dict(torch.load(f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt", map_location=primary_device))
-            net.eval()
-            test_results = val(net, test_loader, loss_fn, primary_device, args.tqdm_able)
-            print("Test results:")
+            if args.dataset == 'dvlog':
+                print("[INFO] Evaluating K-Fold Ensemble on Test Set...")
+                test_metrics_list = []
+                for fold_idx in range(5):
+                    model_path = f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model_fold_{fold_idx}.pt"
+                    if os.path.exists(model_path):
+                        net.load_state_dict(torch.load(model_path, map_location=primary_device))
+                        net.eval()
+                        fold_test_results = val(net, test_loader, loss_fn, primary_device, args.tqdm_able)
+                        test_metrics_list.append(fold_test_results)
+                        print(f"Fold {fold_idx + 1} Test results: {fold_test_results}")
+                if len(test_metrics_list) == 0:
+                    raise RuntimeError("No fold checkpoint found for DVlog evaluation.")
+                test_results = {}
+                for key in test_metrics_list[0].keys():
+                    test_results[key] = np.mean([m[key] for m in test_metrics_list])
+                print("\n[INFO] Final Ensemble Test Results (Averaged across 5 folds):")
+            else:
+                net.load_state_dict(torch.load(f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt", map_location=primary_device))
+                net.eval()
+                test_results = val(net, test_loader, loss_fn, primary_device, args.tqdm_able)
+                print("\nTest results:")
             print(test_results)
             os.makedirs("./results", exist_ok=True)
             with open(f'./results/{args.dataset}_{args.model}_{str(i_iter)}.txt','w') as f:    
                 test_result_str = f'Accuracy:{test_results["acc"]}, Precision:{test_results["precision"]}, Recall:{test_results["recall"]}, F1:{test_results["f1"]}, Avg:{(test_results["acc"] + test_results["precision"]+ test_results["recall"]+ test_results["f1"])/4.0}'
                 f.write(test_result_str)
 
-            # 4. 【新增】将 Artifact 上传和当前迭代的测试指标记录移到循环内部，修复路径错误
             if args.if_wandb:
-                artifact = wandb.Artifact(f"best_model_iter_{i_iter}", type="model")
-                artifact.add_file(f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt")
-                wandb.log_artifact(artifact)
+                if args.dataset == 'dvlog':
+                    for fold_idx in range(5):
+                        model_path = f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model_fold_{fold_idx}.pt"
+                        if os.path.exists(model_path):
+                            artifact = wandb.Artifact(f"best_model_iter_{i_iter}_fold_{fold_idx}", type="model")
+                            artifact.add_file(model_path)
+                            wandb.log_artifact(artifact)
+                else:
+                    artifact = wandb.Artifact(f"best_model_iter_{i_iter}", type="model")
+                    artifact.add_file(f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt")
+                    wandb.log_artifact(artifact)
                 wandb.log({
                     f"test_iter_{i_iter}/acc": test_results["acc"],
                     f"test_iter_{i_iter}/loss": test_results["loss"],
