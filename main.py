@@ -194,6 +194,12 @@ def main():
         else:
             raise NotImplementedError(f"The {args.model} method has not been implemented by this repo")
         net = net.to(primary_device)
+
+        print("[INFO] Freezing low-level projection layers to prevent early overfitting.")
+        for param in net.proj_a.parameters():
+            param.requires_grad = False
+        for param in net.proj_v.parameters():
+            param.requires_grad = False
         
         if args.dataset == 'dvlog':
             kfold_loaders = get_dvlog_kfold_loaders(

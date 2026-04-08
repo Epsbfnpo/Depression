@@ -24,7 +24,7 @@ mmmamba:
   d_ffn: 256
   num_layers: 2
   num_bottlenecks: 2
-  nhead: 4
+  nhead: 2
   activation: 'GELU'
   causal: false
 
@@ -43,7 +43,7 @@ mmmamba_lmvd:
   d_ffn: 256
   num_layers: 2
   num_bottlenecks: 2
-  nhead: 4
+  nhead: 2
   activation: 'GELU'
   causal: false
 
