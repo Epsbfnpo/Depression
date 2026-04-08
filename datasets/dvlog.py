@@ -5,6 +5,7 @@ import random
 import numpy as np
 import torch
 from torch.utils import data
+from sklearn.model_selection import KFold
 
 
 def apply_feature_masking(tensor, time_mask_ratio=0.1, channel_mask_ratio=0.1):
@@ -97,3 +98,32 @@ def get_dvlog_dataloader(root: Union[str, Path], fold: str = "train", gender: st
     dataset = DVlog(root, fold, gender, transform, target_transform, aug)
     dataloader = data.DataLoader(dataset, batch_size=1, shuffle=(fold == "train"), drop_last=False)
     return dataloader
+
+
+def get_dvlog_kfold_loaders(
+    root: Union[str, Path],
+    gender: str = "both",
+    n_splits: int = 5,
+    random_state: int = 42,
+    transform=None,
+    target_transform=None,
+):
+    """
+    Build 5-fold CV loaders by merging original train+valid samples.
+    Test split remains untouched and should be loaded separately.
+    """
+    base_dataset = DVlog(root, fold="train", gender=gender, transform=transform, target_transform=target_transform, aug=False)
+    valid_dataset = DVlog(root, fold="valid", gender=gender, transform=transform, target_transform=target_transform, aug=False)
+    merged_dataset = data.ConcatDataset([base_dataset, valid_dataset])
+
+    all_indices = np.arange(len(merged_dataset))
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    fold_loaders = []
+    for train_idx, val_idx in kf.split(all_indices):
+        train_subset = data.Subset(merged_dataset, train_idx.tolist())
+        val_subset = data.Subset(merged_dataset, val_idx.tolist())
+        train_loader = data.DataLoader(train_subset, batch_size=1, shuffle=True, drop_last=False)
+        val_loader = data.DataLoader(val_subset, batch_size=1, shuffle=False, drop_last=False)
+        fold_loaders.append((train_loader, val_loader))
+
+    return fold_loaders
