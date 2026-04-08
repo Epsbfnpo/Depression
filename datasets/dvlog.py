@@ -1,0 +1,129 @@
+from pathlib import Path
+from typing import Union
+import random
+
+import numpy as np
+import torch
+from torch.utils import data
+from sklearn.model_selection import KFold
+
+
+def apply_feature_masking(tensor, time_mask_ratio=0.1, channel_mask_ratio=0.1):
+    """Feature-level SpecAugment: random contiguous time masking + random channel masking."""
+    T, D = tensor.shape
+
+    if random.random() < 0.5:
+        mask_len = max(1, int(T * time_mask_ratio))
+        start = random.randint(0, T - mask_len)
+        tensor[start:start + mask_len, :] = 0.0
+
+    if random.random() < 0.5:
+        num_channels_to_mask = max(1, int(D * channel_mask_ratio))
+        channels = random.sample(range(D), num_channels_to_mask)
+        tensor[:, channels] = 0.0
+
+    return tensor
+
+
+class DVlog(data.Dataset):
+    def __init__(self, root: Union[str, Path], fold: str = "train", gender: str = "both", transform=None, target_transform=None, aug: bool = False):
+        self.root = root if isinstance(root, Path) else Path(root)
+        self.fold = fold
+        self.gender = gender
+        self.transform = transform
+        self.target_transform = target_transform
+        self.aug = aug
+
+        self.v_features = []
+        self.a_features = []
+        self.labels = []
+
+        with open(self.root / "labels.csv", "r") as f:
+            for line in f:
+                sample = line.strip().split(",")
+                if not self.is_sample(sample):
+                    continue
+
+                s_id = sample[0]
+                s_label = int(sample[1] == "depression")
+                v_feature_path = self.root / s_id / f"{s_id}_visual.npy"
+                a_feature_path = self.root / s_id / f"{s_id}_acoustic.npy"
+
+                self.v_features.append(v_feature_path)
+                self.a_features.append(a_feature_path)
+                self.labels.append(s_label)
+
+                if self.aug and self.fold == "train":
+                    # 仅复制样本索引，不做对齐/拼接截断
+                    for _ in range(5):
+                        if random.random() > 0.5:
+                            self.v_features.append(v_feature_path)
+                            self.a_features.append(a_feature_path)
+                            self.labels.append(s_label)
+
+        print(f"ALL:{len(self.labels)}, Positive:{np.sum(self.labels)}, Negative:{len(self.labels) - np.sum(self.labels)}")
+
+    def is_sample(self, sample) -> bool:
+        gender, fold = sample[3], sample[4]
+        if self.gender == "both":
+            return fold == self.fold
+        return (fold == self.fold) and (gender == self.gender)
+
+    def __getitem__(self, i: int):
+        v_feature = np.load(self.v_features[i])
+        a_feature = np.load(self.a_features[i])
+        label = self.labels[i]
+
+        v_tensor = torch.tensor(v_feature, dtype=torch.float32)
+        a_tensor = torch.tensor(a_feature, dtype=torch.float32)
+        label_tensor = torch.tensor(label, dtype=torch.long)
+
+        if self.fold == "train":
+            v_tensor = apply_feature_masking(v_tensor)
+            a_tensor = apply_feature_masking(a_tensor)
+
+        if self.transform is not None:
+            v_tensor = self.transform(v_tensor)
+            a_tensor = self.transform(a_tensor)
+        if self.target_transform is not None:
+            label_tensor = self.target_transform(label_tensor)
+
+        return {"video": v_tensor, "audio": a_tensor, "label": label_tensor}
+
+    def __len__(self):
+        return len(self.labels)
+
+
+def get_dvlog_dataloader(root: Union[str, Path], fold: str = "train", gender: str = "both", transform=None, target_transform=None, aug: bool = True):
+    dataset = DVlog(root, fold, gender, transform, target_transform, aug)
+    dataloader = data.DataLoader(dataset, batch_size=1, shuffle=(fold == "train"), drop_last=False)
+    return dataloader
+
+
+def get_dvlog_kfold_loaders(
+    root: Union[str, Path],
+    gender: str = "both",
+    n_splits: int = 5,
+    random_state: int = 42,
+    transform=None,
+    target_transform=None,
+):
+    """
+    Build 5-fold CV loaders by merging original train+valid samples.
+    Test split remains untouched and should be loaded separately.
+    """
+    base_dataset = DVlog(root, fold="train", gender=gender, transform=transform, target_transform=target_transform, aug=False)
+    valid_dataset = DVlog(root, fold="valid", gender=gender, transform=transform, target_transform=target_transform, aug=False)
+    merged_dataset = data.ConcatDataset([base_dataset, valid_dataset])
+
+    all_indices = np.arange(len(merged_dataset))
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    fold_loaders = []
+    for train_idx, val_idx in kf.split(all_indices):
+        train_subset = data.Subset(merged_dataset, train_idx.tolist())
+        val_subset = data.Subset(merged_dataset, val_idx.tolist())
+        train_loader = data.DataLoader(train_subset, batch_size=1, shuffle=True, drop_last=False)
+        val_loader = data.DataLoader(val_subset, batch_size=1, shuffle=False, drop_last=False)
+        fold_loaders.append((train_loader, val_loader))
+
+    return fold_loaders
