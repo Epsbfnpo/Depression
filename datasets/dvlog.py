@@ -53,14 +53,6 @@ class DVlog(data.Dataset):
                 self.a_features.append(a_feature_path)
                 self.labels.append(s_label)
 
-                if self.aug and self.fold == "train":
-                    # 仅复制样本索引，不做对齐/拼接截断
-                    for _ in range(5):
-                        if random.random() > 0.5:
-                            self.v_features.append(v_feature_path)
-                            self.a_features.append(a_feature_path)
-                            self.labels.append(s_label)
-
         print(f"ALL:{len(self.labels)}, Positive:{np.sum(self.labels)}, Negative:{len(self.labels) - np.sum(self.labels)}")
 
     def is_sample(self, sample) -> bool:
