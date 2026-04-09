@@ -74,7 +74,16 @@ def _finalize_metrics(running_loss, sample_count, tp, fp, tn, fn):
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1_score = (2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0)
     accuracy = ((tp + tn) / sample_count if sample_count > 0 else 0.0)
-    return {"loss": l, "acc": accuracy, "precision": precision, "recall": recall, "f1": f1_score}
+    pred_pos = tp + fp
+    pred_neg = tn + fn
+    return {
+        "loss": l,
+        "acc": accuracy,
+        "f1": f1_score,
+        "pred_dist": f"Pos:{pred_pos}|Neg:{pred_neg}",
+        "recall": recall,
+        "precision": precision,
+    }
 
 def _get_model_for_checks(net):
     return net.module if isinstance(net, torch.nn.DataParallel) else net
@@ -194,6 +203,9 @@ def main():
         else:
             raise NotImplementedError(f"The {args.model} method has not been implemented by this repo")
         net = net.to(primary_device)
+        # 负类(0)较少，赋予较高权重；正类(1)较多，权重较小。
+        # 权重计算逻辑：(Total / Negative) 和 (Total / Positive) 的归一化变形
+        class_weights = torch.tensor([1.38, 1.0], dtype=torch.float32).to(primary_device)
         
         if args.dataset == 'dvlog':
             kfold_loaders = get_dvlog_kfold_loaders(
@@ -208,7 +220,7 @@ def main():
             val_loader = get_lmvd_dataloader(args.data_dir, "valid", args.test_gender)
             test_loader = get_lmvd_dataloader(args.data_dir, "test", args.test_gender)
             
-        loss_fn = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
+        loss_fn = torch.nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
         initial_state_dict = copy.deepcopy(net.state_dict())
 
         def build_optimizer_and_scheduler():
@@ -244,7 +256,12 @@ def main():
                     best_val_loss = float('inf')
                     early_stop_patience = 10
                     early_stop_counter = 0
+                    warmup_epochs = 5
                     for epoch in range(args.epochs):
+                        if epoch < warmup_epochs:
+                            lr_scale = min(1.0, float(epoch + 1) / warmup_epochs)
+                            for pg in optimizer.param_groups:
+                                pg["lr"] = lr_scale * args.learning_rate
                         train_results = train_epoch(
                             net,
                             train_loader,
@@ -292,7 +309,12 @@ def main():
                 best_val_loss = float('inf')
                 early_stop_patience = 10
                 early_stop_counter = 0
+                warmup_epochs = 5
                 for epoch in range(args.epochs):
+                    if epoch < warmup_epochs:
+                        lr_scale = min(1.0, float(epoch + 1) / warmup_epochs)
+                        for pg in optimizer.param_groups:
+                            pg["lr"] = lr_scale * args.learning_rate
                     train_results = train_epoch(
                         net,
                         train_loader,
@@ -351,7 +373,11 @@ def main():
                     raise RuntimeError("No fold checkpoint found for DVlog evaluation.")
                 test_results = {}
                 for key in test_metrics_list[0].keys():
-                    test_results[key] = np.mean([m[key] for m in test_metrics_list])
+                    first_value = test_metrics_list[0][key]
+                    if isinstance(first_value, (int, float, np.floating)):
+                        test_results[key] = np.mean([m[key] for m in test_metrics_list])
+                    else:
+                        test_results[key] = "ensemble"
                 print("\n[INFO] Final Ensemble Test Results (Averaged across 5 folds):")
             else:
                 net.load_state_dict(torch.load(f"{args.save_dir}/{args.dataset}_{args.model}_{str(i_iter)}/checkpoints/best_model.pt", map_location=primary_device))
